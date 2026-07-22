@@ -546,7 +546,6 @@ export class WorkflowEngine {
     }
     const artifactDir = path.join(runDir, "agents", nodeId, attemptId);
     const resultPath = path.join(artifactDir, "result.json");
-    const exitPath = path.join(artifactDir, "session.exit");
     const prompt = appendStepContract(
       basePrompt,
       workflow.name,
@@ -572,7 +571,6 @@ export class WorkflowEngine {
           nodeId,
           attemptId,
           resultPath,
-          exitPath,
           artifactDir,
           ...(node.expectedOutput !== undefined ? { expectedOutput: node.expectedOutput } : {}),
         },

@@ -1,23 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /**
- * Result-file protocol (interactive-subagents-style sidecars).
+ * Result-file protocol for workflow agent attempts.
  *
  * Per agent attempt, under `runDir/agents/<nodeId>/<attemptId>/`:
  * - `result.json`  — structured output written by `workflow_done`
- * - `session.exit` — exit sidecar `{ type: "done" | "error" | "rejected", ... }`
  * - `task.md`      — full prompt delivered to the child
- * - `session.jsonl`— optional child session path (when known)
+ * - `agent-env.sh` — environment sourced into the pane shell before agent start
  *
- * Engine owns routing/validation. Herdr only delivers prompts into panes and
- * the orchestrator polls these files for completion.
+ * Engine owns routing/validation. Herdr delivers prompts into panes and waits
+ * on agent lifecycle signals; `result.json` is the authoritative payload.
  */
-
-export type ExitSidecar =
-  | { type: "done" }
-  | { type: "error"; errorMessage: string }
-  | { type: "rejected"; error: string };
 
 export type ResultFilePayload = {
   schema: "pi-herdr-workflows.result.v1";
@@ -52,20 +46,6 @@ export function writeResultFile(
   writeFileSync(resultPath, `${JSON.stringify(body, null, 2)}\n`, "utf8");
 }
 
-export function writeExitSidecar(exitPath: string, sidecar: ExitSidecar): void {
-  mkdirSync(path.dirname(exitPath), { recursive: true });
-  writeFileSync(exitPath, `${JSON.stringify(sidecar)}\n`, "utf8");
-}
-
-export function readExitSidecar(exitPath: string): ExitSidecar | null {
-  if (!existsSync(exitPath)) return null;
-  try {
-    return JSON.parse(readFileSync(exitPath, "utf8")) as ExitSidecar;
-  } catch {
-    return null;
-  }
-}
-
 export function readResultFile(resultPath: string): ResultFilePayload | null {
   if (!existsSync(resultPath)) return null;
   try {
@@ -75,20 +55,10 @@ export function readResultFile(resultPath: string): ResultFilePayload | null {
   }
 }
 
-export async function pollUntil(
-  check: () => boolean | Promise<boolean>,
-  options: { intervalMs?: number; signal?: AbortSignal } = {},
-): Promise<void> {
-  const intervalMs = options.intervalMs ?? 250;
-  const signal = options.signal;
-  for (;;) {
-    if (signal?.aborted) {
-      const reason: unknown = signal.reason;
-      throw reason instanceof Error ? reason : new Error("Aborted");
-    }
-    if (await check()) return;
-    await sleep(intervalMs, signal);
-  }
+/** Drop a rejected result so a later wait cannot accept the stale payload. */
+export function clearResultFile(resultPath: string): void {
+  if (!existsSync(resultPath)) return;
+  unlinkSync(resultPath);
 }
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

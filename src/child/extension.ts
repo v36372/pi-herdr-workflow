@@ -1,9 +1,9 @@
 /**
  * Child-pane extension loaded into each agent node.
  *
- * `workflow_done` writes structured output to result.json. With `pi -p`, the
- * process then ends and herdr reports the pane idle/done — the orchestrator
- * waits via herdr wait_agent / wait agent-status, not an exit sidecar.
+ * `workflow_done` writes structured output to result.json. The child is an
+ * interactive pi started by Herdr's agent facade; terminating this tool batch
+ * settles the agent so `herdr agent prompt --wait` returns to the orchestrator.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -29,36 +29,18 @@ export default function (pi: ExtensionAPI) {
     parameters: WorkflowDoneParams,
     async execute(_toolCallId, params) {
       if (!resultPath) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "PI_WORKFLOW_RESULT_PATH is not set. This tool only works inside a herdr-dispatched workflow agent pane.",
-            },
-          ],
-          details: { resultPath: "" },
-          isError: true,
-        };
+        throw new Error(
+          "PI_WORKFLOW_RESULT_PATH is not set. workflow_done only works inside a Herdr-dispatched workflow agent.",
+        );
       }
 
-      try {
-        writeResultFile(resultPath, {
-          runId,
-          nodeId,
-          attemptId,
-          output: params.output,
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text" as const, text: `Failed to write result: ${message}` }],
-          details: { resultPath },
-          isError: true,
-        };
-      }
+      writeResultFile(resultPath, {
+        runId,
+        nodeId,
+        attemptId,
+        output: params.output,
+      });
 
-      // Do not call shutdown here. Launch uses `pi -p`, so the process exits
-      // after this turn and herdr flips the pane to idle for wait_agent.
       return {
         content: [
           {
@@ -67,6 +49,7 @@ export default function (pi: ExtensionAPI) {
           },
         ],
         details: { resultPath },
+        terminate: true,
       };
     },
   });

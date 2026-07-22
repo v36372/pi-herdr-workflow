@@ -1,20 +1,22 @@
 export * from "./workflows/index.js";
-export { HerdrClient } from "./herdr/client.js";
-export { HerdrStepExecutor, writeFakeAgentResult } from "./herdr/executor.js";
+export { HerdrClient, HerdrError, isHerdrError } from "./herdr/client.js";
+export {
+  DEFAULT_MAX_VALIDATION_ATTEMPTS,
+  HerdrStepExecutor,
+  writeFakeAgentResult,
+} from "./herdr/executor.js";
 export type {
   HerdrAgentWaitProgress,
   HerdrStepExecutorOptions,
-  LaunchContext,
+  AgentStartContext,
 } from "./herdr/executor.js";
 /** Forked herdr tool (was @ogulcancelik/pi-herdr). */
 export { default as registerHerdrTool } from "./herdr/tool.js";
 export {
+  clearResultFile,
   ensureArtifactDir,
-  pollUntil,
-  readExitSidecar,
   readResultFile,
-  writeExitSidecar,
   writeResultFile,
   writeTaskFile,
 } from "./herdr/result-file.js";
-export type { ExitSidecar, ResultFilePayload } from "./herdr/result-file.js";
+export type { ResultFilePayload } from "./herdr/result-file.js";

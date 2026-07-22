@@ -1,0 +1,513 @@
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+import { HerdrClient, HerdrError, isHerdrError, type HerdrExecResult } from "../src/herdr/client.ts";
+import {
+  DEFAULT_MAX_VALIDATION_ATTEMPTS,
+  HerdrStepExecutor,
+  writeFakeAgentResult,
+} from "../src/herdr/executor.ts";
+import { clearResultFile, readResultFile } from "../src/herdr/result-file.ts";
+
+function okJson(result: unknown = {}): HerdrExecResult {
+  return { code: 0, stdout: JSON.stringify({ result }), stderr: "" };
+}
+
+function errJson(code: string, message: string, exitCode = 1): HerdrExecResult {
+  return {
+    code: exitCode,
+    stdout: JSON.stringify({ error: { code, message }, id: `cli:test:${code}` }),
+    stderr: "",
+  };
+}
+
+function baseContract(artifactDir: string, resultPath: string) {
+  return {
+    runId: "run-1",
+    workflowName: "review-flow",
+    nodeId: "review",
+    attemptId: "12345678-abcd",
+    artifactDir,
+    resultPath,
+  };
+}
+
+test("executor starts and prompts pi through Herdr 0.7.5 agent facade", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-agent-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const calls: string[][] = [];
+  const progress: string[] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w1" },
+          root_pane: { pane_id: "w1:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-1",
+          nodeId: "review",
+          attemptId: "12345678-abcd",
+          output: { verdict: "ok" },
+        });
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    client,
+    cwd: root,
+    onProgress: (event) => progress.push(event.phase),
+  });
+
+  try {
+    const submission = await executor.runAgentStep(
+      {
+        contract: baseContract(artifactDir, resultPath),
+        prompt: "Review the change and call workflow_done.",
+        spawn: {
+          name: "Scout: Auth",
+          tools: "read",
+          fork: false,
+        },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+
+    assert.deepEqual(submission.output, { verdict: "ok" });
+    const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
+    assert.ok(start);
+    assert.deepEqual(start!.slice(0, 8), [
+      "agent",
+      "start",
+      "scout-auth-12345678",
+      "--kind",
+      "pi",
+      "--pane",
+      "w1:p1",
+      "--",
+    ]);
+    assert.ok(start!.includes("--no-session"));
+    assert.ok(start!.includes("-ne"));
+    assert.equal(start![start!.indexOf("--tools") + 1], "read,workflow_done");
+
+    const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt");
+    assert.ok(prompt);
+    assert.equal(prompt![2], "scout-auth-12345678");
+    assert.equal(prompt![3], "Review the change and call workflow_done.");
+    assert.ok(prompt!.includes("--wait"));
+    assert.deepEqual(progress, ["agent_start", "agent_prompt", "result"]);
+    assert.equal(
+      calls.some((args) => args[0] === "pane" && args[1] === "run" && args.includes("pi")),
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executor merges named agent defaults and preloads requested skills", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-defaults-"));
+  const cwd = path.join(root, "work");
+  const artifactDir = path.join(root, "artifacts", "inspect", "abcdef12-run");
+  const resultPath = path.join(artifactDir, "result.json");
+  const agentDir = path.join(root, ".pi", "agents");
+  const skillDir = path.join(cwd, ".pi", "skills", "workflow-test-skill");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    path.join(agentDir, "researcher.md"),
+    `---\nname: researcher\nmodel: test/default-model\nthinking: high\ntools: read,bash\ncwd: ./work\nsystem-prompt: replace\n---\n\nYou are the research specialist.\n`,
+  );
+  writeFileSync(
+    path.join(skillDir, "SKILL.md"),
+    `---\nname: workflow-test-skill\ndescription: Test workflow skill loading.\n---\n\nFollow the workflow test procedure.\n`,
+  );
+
+  const calls: string[][] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w2" },
+          root_pane: { pane_id: "w2:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-2",
+          nodeId: "inspect",
+          attemptId: "abcdef12-run",
+          output: { loaded: true },
+        });
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({ client, cwd: root });
+
+  try {
+    const submission = await executor.runAgentStep(
+      {
+        contract: {
+          runId: "run-2",
+          workflowName: "defaults-flow",
+          nodeId: "inspect",
+          attemptId: "abcdef12-run",
+          artifactDir,
+          resultPath,
+        },
+        prompt: "Inspect the target and call workflow_done.",
+        spawn: {
+          name: "Researcher",
+          agent: "researcher",
+          systemPrompt: "Return concise evidence.",
+          skills: "workflow-test-skill",
+          fork: false,
+        },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+
+    assert.deepEqual(submission.output, { loaded: true });
+    const workspace = calls.find((args) => args[0] === "workspace" && args[1] === "create");
+    assert.ok(workspace);
+    assert.equal(workspace![workspace!.indexOf("--cwd") + 1], cwd);
+
+    const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
+    assert.ok(start);
+    assert.equal(start![start!.indexOf("--model") + 1], "test/default-model");
+    assert.equal(start![start!.indexOf("--thinking") + 1], "high");
+    assert.equal(start![start!.indexOf("--tools") + 1], "read,bash,workflow_done");
+    assert.equal(
+      start![start!.indexOf("--system-prompt") + 1],
+      "You are the research specialist.",
+    );
+    assert.equal(
+      start![start!.indexOf("--append-system-prompt") + 1],
+      "Return concise evidence.",
+    );
+
+    const promptCall = calls.find((args) => args[0] === "agent" && args[1] === "prompt");
+    assert.ok(promptCall);
+    assert.match(promptCall![3]!, /<skill name="workflow-test-skill"/);
+    assert.match(promptCall![3]!, /References are relative to .*workflow-test-skill/);
+    assert.match(promptCall![3]!, /Follow the workflow test procedure\./);
+    assert.match(promptCall![3]!, /Inspect the target and call workflow_done\.$/);
+    assert.equal(readFileSync(path.join(artifactDir, "task.md"), "utf8"), promptCall![3]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executor re-prompts the same agent on validation failure and clears stale results", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-retry-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const promptCalls: string[] = [];
+  const progress: Array<{ phase: string; submission?: number }> = [];
+  let promptCount = 0;
+
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w3" },
+          root_pane: { pane_id: "w3:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        promptCount += 1;
+        promptCalls.push(args[3]!);
+        // Simulate a stale rejected payload still on disk when the wait returns.
+        // The executor must clear it before accepting a later submission.
+        if (promptCount === 1) {
+          writeFakeAgentResult({
+            resultPath,
+            runId: "run-1",
+            nodeId: "review",
+            attemptId: "12345678-abcd",
+            output: { score: "bad" },
+          });
+        } else {
+          // Prove stale content was cleared before the second wait resolved.
+          assert.equal(existsSync(resultPath), false);
+          writeFakeAgentResult({
+            resultPath,
+            runId: "run-1",
+            nodeId: "review",
+            attemptId: "12345678-abcd",
+            output: { score: 42 },
+          });
+        }
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    client,
+    cwd: root,
+    maxValidationAttempts: 3,
+    onProgress: (event) => progress.push({ phase: event.phase, submission: event.submission }),
+  });
+
+  try {
+    const submission = await executor.runAgentStep(
+      {
+        contract: baseContract(artifactDir, resultPath),
+        prompt: "Return a numeric score via workflow_done.",
+        spawn: { name: "scorer", tools: "read", fork: false },
+        accept: async (output) => {
+          const score = (output as { score?: unknown }).score;
+          if (typeof score !== "number") {
+            return { ok: false, error: "score must be a number" };
+          }
+          return { ok: true, value: output };
+        },
+      },
+      new AbortController().signal,
+    );
+
+    assert.deepEqual(submission.output, { score: 42 });
+    assert.equal(promptCount, 2);
+    assert.equal(promptCalls[0], "Return a numeric score via workflow_done.");
+    assert.match(promptCalls[1]!, /score must be a number/);
+    assert.match(promptCalls[1]!, /Submission 1 of 3/);
+    assert.match(promptCalls[1]!, /result\.json was cleared/);
+    // task.md remains the original submitted task, not the retry prompt.
+    assert.equal(
+      readFileSync(path.join(artifactDir, "task.md"), "utf8"),
+      "Return a numeric score via workflow_done.",
+    );
+    assert.deepEqual(
+      progress.map((event) => event.phase),
+      ["agent_start", "agent_prompt", "validation_retry", "result"],
+    );
+    assert.equal(progress[2]?.submission, 2);
+    assert.ok(readResultFile(resultPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executor fails after the validation attempt ceiling", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-retry-cap-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  let promptCount = 0;
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w4" },
+          root_pane: { pane_id: "w4:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        promptCount += 1;
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-1",
+          nodeId: "review",
+          attemptId: "12345678-abcd",
+          output: { score: "still-bad" },
+        });
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    client,
+    cwd: root,
+    maxValidationAttempts: 2,
+  });
+
+  try {
+    await assert.rejects(
+      () =>
+        executor.runAgentStep(
+          {
+            contract: baseContract(artifactDir, resultPath),
+            prompt: "Return a numeric score via workflow_done.",
+            spawn: { name: "scorer", tools: "read", fork: false },
+            accept: async () => ({ ok: false, error: "score must be a number" }),
+          },
+          new AbortController().signal,
+        ),
+      /Agent output rejected after 2 submission\(s\): score must be a number/,
+    );
+    assert.equal(promptCount, 2);
+    assert.equal(existsSync(resultPath), false);
+    assert.equal(DEFAULT_MAX_VALIDATION_ATTEMPTS, 3);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("HerdrClient preserves machine-readable error codes", async () => {
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[1] === "prompt") {
+        return errJson("agent_prompt_stalled", "agent did not start working");
+      }
+      if (args[1] === "wait") {
+        return errJson("agent_not_running", "agent is no longer running in the target pane");
+      }
+      if (args[1] === "start") {
+        return errJson("protocol_mismatch", "client and server protocol differ");
+      }
+      return okJson();
+    },
+  });
+
+  await assert.rejects(
+    () => client.agentPrompt("demo", "hi", { wait: true }),
+    (error: unknown) => {
+      assert.ok(isHerdrError(error));
+      assert.equal((error as HerdrError).code, "agent_prompt_stalled");
+      assert.match((error as HerdrError).message, /did not start working/);
+      assert.equal((error as HerdrError).id, "cli:test:agent_prompt_stalled");
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    () => client.agentWait("demo", ["idle"], 1000),
+    (error: unknown) => {
+      assert.ok(isHerdrError(error));
+      assert.equal((error as HerdrError).code, "agent_not_running");
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    () => client.agentStart({ name: "demo", kind: "pi", paneId: "w:p" }),
+    (error: unknown) => {
+      assert.ok(isHerdrError(error));
+      assert.equal((error as HerdrError).code, "protocol_mismatch");
+      return true;
+    },
+  );
+});
+
+test("HerdrClient.exec raises typed errors for zero-exit JSON envelopes", async () => {
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[0] === "agent" && args[1] === "prompt") {
+        return errJson("agent_prompt_stalled", "no state change observed", 0);
+      }
+      if (args[0] === "agent" && args[1] === "read") {
+        // Ordinary text must not be treated as an error envelope.
+        return { code: 0, stdout: "plain agent transcript\n", stderr: "" };
+      }
+      return okJson();
+    },
+  });
+
+  await assert.rejects(
+    () => client.agentPrompt("demo", "hi", { wait: true }),
+    (error: unknown) => {
+      assert.ok(isHerdrError(error));
+      assert.equal((error as HerdrError).code, "agent_prompt_stalled");
+      assert.equal((error as HerdrError).exitCode, 0);
+      assert.match((error as HerdrError).message, /no state change observed/);
+      assert.equal((error as HerdrError).id, "cli:test:agent_prompt_stalled");
+      return true;
+    },
+  );
+
+  const text = await client.agentRead("demo");
+  assert.equal(text, "plain agent transcript\n");
+});
+
+test("executor maps actionable Herdr error codes", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-err-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w5" },
+          root_pane: { pane_id: "w5:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        return errJson("agent_prompt_stalled", "no state change observed");
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({ client, cwd: root });
+
+  try {
+    await assert.rejects(
+      () =>
+        executor.runAgentStep(
+          {
+            contract: baseContract(artifactDir, resultPath),
+            prompt: "do work",
+            spawn: { name: "worker", tools: "read", fork: false },
+            accept: async (output) => ({ ok: true, value: output }),
+          },
+          new AbortController().signal,
+        ),
+      (error: unknown) => {
+        assert.ok(isHerdrError(error));
+        assert.equal((error as HerdrError).code, "agent_prompt_stalled");
+        assert.match((error as HerdrError).message, /did not begin working/);
+        assert.match((error as HerdrError).message, /blocked on a prompt/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client agent read/send-keys use the agent facade", async () => {
+  const calls: string[][] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "agent" && args[1] === "read") {
+        return { code: 0, stdout: "agent transcript\n", stderr: "" };
+      }
+      return okJson();
+    },
+  });
+
+  const text = await client.agentRead("demo-agent", { source: "recent", lines: 12 });
+  await client.agentSendKeys("demo-agent", ["C-c", "Enter"]);
+  assert.equal(text, "agent transcript\n");
+  assert.deepEqual(calls[0], ["agent", "read", "demo-agent", "--source", "recent", "--lines", "12"]);
+  assert.deepEqual(calls[1], ["agent", "send-keys", "demo-agent", "C-c", "Enter"]);
+});
+
+test("clearResultFile removes rejected payloads", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-clear-"));
+  const resultPath = path.join(root, "result.json");
+  writeFakeAgentResult({
+    resultPath,
+    runId: "r",
+    nodeId: "n",
+    attemptId: "a",
+    output: { stale: true },
+  });
+  assert.ok(readResultFile(resultPath));
+  clearResultFile(resultPath);
+  assert.equal(readResultFile(resultPath), null);
+  clearResultFile(resultPath); // idempotent
+  rmSync(root, { recursive: true, force: true });
+});

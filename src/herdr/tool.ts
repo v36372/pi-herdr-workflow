@@ -8,6 +8,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "@earendil-wo
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { HerdrError } from "./client.js";
 
 type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 type ReadSource = "visible" | "recent" | "recent-unwrapped" | "detection";
@@ -127,6 +128,8 @@ const ActionEnum = StringEnum(
 		"pane_split",
 		"agent_list",
 		"agent_get",
+		"agent_start",
+		"agent_prompt",
 		"run",
 		"read",
 		"watch",
@@ -221,14 +224,17 @@ export default function (pi: ExtensionAPI) {
 		if (index !== -1) aliasOrder.splice(index, 1);
 	}
 
-	function parseHerdrError(output: string): string | null {
+	function parseHerdrFailure(output: string): { code: string; message: string; id?: string } | null {
 		const trimmed = output.trim();
 		if (!trimmed) return null;
 		try {
 			const value = JSON.parse(trimmed) as HerdrJsonEnvelope;
-			return value.error?.message || value.error?.code || trimmed;
+			if (!value.error) return null;
+			const code = value.error.code?.trim() || "command_failed";
+			const message = value.error.message?.trim() || code;
+			return value.id ? { code, message, id: value.id } : { code, message };
 		} catch {
-			return trimmed;
+			return { code: "command_failed", message: trimmed };
 		}
 	}
 
@@ -257,11 +263,18 @@ export default function (pi: ExtensionAPI) {
 			throw new Error("Aborted");
 		}
 		if (result.code !== 0) {
-			const message =
-				parseHerdrError(result.stderr) ||
-				parseHerdrError(result.stdout) ||
-				`herdr ${args.join(" ")} failed with exit code ${result.code}`;
-			throw new Error(message);
+			const failure =
+				parseHerdrFailure(result.stderr) ||
+				parseHerdrFailure(result.stdout) ||
+				{
+					code: "command_failed",
+					message: `herdr ${args.join(" ")} failed with exit code ${result.code}`,
+				};
+			throw new HerdrError(failure.code, failure.message, {
+				args,
+				exitCode: result.code,
+				...(failure.id ? { id: failure.id } : {}),
+			});
 		}
 		return result;
 	}
@@ -270,16 +283,29 @@ export default function (pi: ExtensionAPI) {
 		const result = await execHerdr(args, signal);
 		const stdout = result.stdout.trim();
 		if (!stdout) {
-			throw new Error(`Expected JSON output from herdr ${args.join(" ")}`);
+			throw new HerdrError("invalid_response", `Expected JSON output from herdr ${args.join(" ")}`, {
+				args,
+				exitCode: result.code,
+			});
 		}
 		let value: HerdrJsonEnvelope;
 		try {
 			value = JSON.parse(stdout) as HerdrJsonEnvelope;
-		} catch {
-			throw new Error(`Failed to parse JSON from herdr ${args.join(" ")}`);
+		} catch (cause) {
+			throw new HerdrError("invalid_response", `Failed to parse JSON from herdr ${args.join(" ")}`, {
+				args,
+				exitCode: result.code,
+				cause,
+			});
 		}
 		if (value.error) {
-			throw new Error(value.error.message || value.error.code || `herdr ${args.join(" ")} failed`);
+			const code = value.error.code?.trim() || "command_failed";
+			const message = value.error.message?.trim() || code;
+			throw new HerdrError(code, message, {
+				args,
+				exitCode: result.code,
+				...(value.id ? { id: value.id } : {}),
+			});
 		}
 		return value as T;
 	}
@@ -348,6 +374,11 @@ export default function (pi: ExtensionAPI) {
 		return response.result.agents || [];
 	}
 
+	async function getAgentInfo(target: string, signal?: AbortSignal): Promise<AgentInfo> {
+		const response = await execHerdrJson<{ result: { agent: AgentInfo } }>(["agent", "get", target], signal);
+		return response.result.agent;
+	}
+
 	function chooseSplitDirection(layout: PaneLayoutSnapshot, paneId: string): SplitDirection {
 		const pane = layout.panes.find((candidate) => candidate.pane_id === paneId);
 		if (!pane) return "right";
@@ -398,6 +429,74 @@ export default function (pi: ExtensionAPI) {
 		if (options.lines != null) args.push("--lines", String(options.lines));
 		if (options.raw) args.push("--raw");
 		return execHerdrText(args, signal);
+	}
+
+	async function readAgent(
+		target: string,
+		options: { source?: ReadSource; lines?: number; raw?: boolean },
+		signal?: AbortSignal,
+	): Promise<string> {
+		const args = ["agent", "read", target];
+		if (options.source) args.push("--source", options.source);
+		if (options.lines != null) args.push("--lines", String(options.lines));
+		if (options.raw) args.push("--ansi");
+		return execHerdrText(args, signal);
+	}
+
+	/** Prefer explicit agent targets; otherwise use a live agent hosted by the pane. */
+	async function resolveControlTarget(
+		params: { agent?: string; pane?: string },
+		signal?: AbortSignal,
+	): Promise<
+		| { kind: "agent"; target: string; label: string; pane?: PaneInfo; alias?: string }
+		| { kind: "pane"; pane: PaneInfo; alias?: string }
+	> {
+		if (params.agent) {
+			let target = params.agent;
+			if (managedPanes.has(target)) {
+				target = (await requirePaneRef(target, signal)).pane.pane_id;
+			}
+			const agent = await getAgentInfo(target, signal);
+			// Prefer a unique live name when present; pane ids remain valid targets.
+			const cliTarget = agent.name || target;
+			return {
+				kind: "agent",
+				target: cliTarget,
+				label: agentDisplayName(agent),
+				pane: {
+					pane_id: agent.pane_id,
+					workspace_id: agent.workspace_id,
+					tab_id: agent.tab_id,
+					focused: agent.focused,
+					agent_status: agent.agent_status,
+					revision: agent.revision,
+					...(agent.cwd ? { cwd: agent.cwd } : {}),
+					...(agent.agent ? { agent: agent.agent } : {}),
+					...(agent.title ? { title: agent.title } : {}),
+				},
+			};
+		}
+		if (!params.pane) {
+			throw new Error("'agent' or 'pane' is required");
+		}
+		const resolved = await requirePaneRef(params.pane, signal);
+		if (resolved.pane.agent_status !== "unknown") {
+			try {
+				const agent = await getAgentInfo(resolved.pane.pane_id, signal);
+				return {
+					kind: "agent",
+					// Pane id is a stable CLI target for the hosted agent.
+					target: agent.name || resolved.pane.pane_id,
+					label: agentDisplayName(agent),
+					pane: resolved.pane,
+					alias: resolved.alias,
+				};
+			} catch (error) {
+				if (isAbortError(error, signal)) throw error;
+				// Fall through to pane primitives for ordinary terminals.
+			}
+		}
+		return { kind: "pane", pane: resolved.pane, alias: resolved.alias };
 	}
 
 	function formatReadOutput(output: string): string {
@@ -473,23 +572,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function sleepWithSignal(ms: number, signal: AbortSignal | undefined) {
-		if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
-		if (signal.aborted) return Promise.reject(new Error("wait_agent canceled."));
-		return new Promise<void>((resolve, reject) => {
-			const timer = setTimeout(() => {
-				signal.removeEventListener("abort", onAbort);
-				resolve();
-			}, ms);
-			const onAbort = () => {
-				clearTimeout(timer);
-				signal.removeEventListener("abort", onAbort);
-				reject(new Error("wait_agent canceled."));
-			};
-			signal.addEventListener("abort", onAbort, { once: true });
-		});
-	}
-
 	function statusDot(theme: any, status: AgentStatus): string {
 		switch (status) {
 			case "blocked":
@@ -516,7 +598,8 @@ export default function (pi: ExtensionAPI) {
 			"Use `herdr` only when the user explicitly mentions Herdr or asks to inspect or control Herdr contexts. Do not invoke it merely because background work or delegation might help.",
 			"When the user asks to use Herdr, default to a sibling pane in the current tab and cwd. Create another tab, workspace, or cwd only when the user requests that topology.",
 			"Preserve the current UI focus by default. Set focus only when the user explicitly asks to switch context.",
-			"Use `herdr` run to submit a command or agent prompt because text and Enter are sent atomically. Use `herdr` send only for literal text or key injection without command submission semantics.",
+			"Use `herdr` agent_start to start a supported interactive agent in an existing shell pane, then agent_prompt to submit work and wait for a lifecycle signal. Use run only for ordinary shell commands.",
+			"For agent-hosted panes, prefer `agent` (or a pane that already hosts an agent) with read/send so keys and output use the agent facade. Raw pane controls remain for ordinary terminals.",
 			"Use `herdr` watch for normal command output and `herdr` wait_agent only for recognized coding agents.",
 			"Treat both `idle` and `done` as completed agent states when inspecting status. `done` means the completed result is unseen; `idle` means it is seen.",
 			"Use `recent-unwrapped` for logs and transcripts, and `detection` only when agent-detection evidence is needed.",
@@ -533,21 +616,26 @@ export default function (pi: ExtensionAPI) {
 			label: Type.Optional(Type.String({ description: "Label for create, pane_split, or pane_rename actions" })),
 			newPane: Type.Optional(Type.String({ description: "Alias to remember for the pane created by pane_split" })),
 			direction: Type.Optional(DirectionEnum),
-			agent: Type.Optional(Type.String({ description: "Agent name, terminal id, or pane id for agent_get" })),
-			command: Type.Optional(Type.String({ description: "Line to submit atomically with Enter (for run action)" })),
+			agent: Type.Optional(Type.String({ description: "Unique live agent name or pane id" })),
+			name: Type.Optional(Type.String({ description: "Strict unique name for agent_start" })),
+			kind: Type.Optional(Type.String({ description: "Supported agent kind for agent_start, such as pi, codex, or claude" })),
+			agentArgs: Type.Optional(Type.Array(Type.String(), { description: "Native agent arguments passed after --" })),
+			prompt: Type.Optional(Type.String({ description: "Prompt text for agent_prompt" })),
+			wait: Type.Optional(Type.Boolean({ description: "Wait for a lifecycle signal after agent_prompt; defaults true" })),
+			command: Type.Optional(Type.String({ description: "Ordinary shell command submitted atomically for run" })),
 			match: Type.Optional(Type.String({ description: "Text or regex to wait for (for watch action)" })),
 			regex: Type.Optional(Type.Boolean({ description: "Treat match as a regex (for watch action)" })),
 			status: Type.Optional(StatusEnum),
-			statuses: Type.Optional(Type.Array(StatusEnum, { description: "Accepted agent statuses for wait_agent" })),
+			statuses: Type.Optional(Type.Array(StatusEnum, { description: "Accepted statuses for agent_prompt or wait_agent" })),
 			mode: Type.Optional(WaitModeEnum),
-			timeout: Type.Optional(Type.Number({ description: "Timeout in ms (for watch or wait_agent action)" })),
+			timeout: Type.Optional(Type.Number({ description: "Timeout in ms for agent_start, agent_prompt, watch, or wait_agent" })),
 			lines: Type.Optional(Type.Number({ description: "Scrollback lines to capture or inspect" })),
 			source: Type.Optional(SourceEnum),
 			raw: Type.Optional(Type.Boolean({ description: "Disable ANSI stripping for read/watch" })),
-			text: Type.Optional(Type.String({ description: "Literal text to send without Enter (for send action). Use run if you want text plus Enter atomically." })),
+			text: Type.Optional(Type.String({ description: "Literal text to send without Enter (for send action; pane path). Use run if you want text plus Enter atomically." })),
 			keys: Type.Optional(
 				Type.String({
-					description: "Keys to send, space-separated (for send action). Examples: C-c, Enter, q, y",
+					description: "Keys to send, space-separated (for send action). Uses agent send-keys when the target is an agent. Examples: C-c, Enter, q, y",
 				}),
 			),
 			cwd: Type.Optional(Type.String({ description: "Working directory for workspace_create, tab_create, and pane_split where supported" })),
@@ -804,6 +892,71 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
+				case "agent_start": {
+					rejectUnexpectedParams("agent_start", params, ["workspace", "tab"]);
+					const paneRef = params.pane;
+					if (!paneRef) throw new Error("'pane' is required for agent_start");
+					if (!params.name) throw new Error("'name' is required for agent_start");
+					if (!params.kind) throw new Error("'kind' is required for agent_start");
+					const resolved = await requirePaneRef(paneRef, signal);
+					const args = [
+						"agent",
+						"start",
+						params.name,
+						"--kind",
+						params.kind,
+						"--pane",
+						resolved.pane.pane_id,
+					];
+					if (params.timeout != null) args.push("--timeout", String(params.timeout));
+					if (params.agentArgs?.length) args.push("--", ...params.agentArgs);
+					await execHerdr(args, signal);
+					const agent = await getAgentInfo(params.name, signal);
+					return {
+						content: [{ type: "text", text: `Started ${params.kind} agent '${params.name}' in ${resolved.alias || resolved.pane.pane_id}` }],
+						details: withSnapshot({ action: "agent_start", agent }),
+					};
+				}
+
+				case "agent_prompt": {
+					rejectUnexpectedParams("agent_prompt", params, ["workspace", "tab"]);
+					let target = params.agent ?? params.pane;
+					if (!target) throw new Error("'agent' or 'pane' is required for agent_prompt");
+					if (!params.prompt) throw new Error("'prompt' is required for agent_prompt");
+					if (managedPanes.has(target)) {
+						target = (await requirePaneRef(target, signal)).pane.pane_id;
+					}
+					const startedAt = Date.now();
+					const publishPromptUpdate = () => onUpdate?.({
+						content: [{ type: "text", text: `Waiting for agent '${target}'...` }],
+						details: withSnapshot({
+							action: "agent_prompt",
+							agentTarget: target,
+							elapsed: Math.floor((Date.now() - startedAt) / 1000),
+						}),
+					});
+					publishPromptUpdate();
+					const updateTimer = onUpdate ? setInterval(publishPromptUpdate, 1000) : null;
+					try {
+						const args = ["agent", "prompt", target, params.prompt];
+						if (params.wait !== false) args.push("--wait");
+						for (const status of params.statuses ?? []) args.push("--until", status);
+						if (params.timeout != null) args.push("--timeout", String(params.timeout));
+						await execHerdr(args, signal);
+						const agent = await getAgentInfo(target, signal);
+						return {
+							content: [{ type: "text", text: `Agent '${agentDisplayName(agent)}' is ${agent.agent_status}` }],
+							details: withSnapshot({
+								action: "agent_prompt",
+								agent,
+								elapsed: Math.floor((Date.now() - startedAt) / 1000),
+							}),
+						};
+					} finally {
+						if (updateTimer) clearInterval(updateTimer);
+					}
+				}
+
 				case "run": {
 					rejectUnexpectedParams("run", params, ["workspace", "tab"]);
 					const paneRef = params.pane;
@@ -845,27 +998,32 @@ export default function (pi: ExtensionAPI) {
 
 				case "read": {
 					rejectUnexpectedParams("read", params, ["workspace", "tab"]);
-					const paneRef = params.pane;
-					if (!paneRef) throw new Error("'pane' is required for read");
-
-					const resolved = await requirePaneRef(paneRef, signal);
-
-					const output = await readPane(
-						resolved.pane.pane_id,
-						{
-							source: params.source ?? "recent",
-							lines: params.lines ?? 20,
-							raw: params.raw,
-						},
+					const target = await resolveControlTarget(
+						{ agent: params.agent, pane: params.pane },
 						signal,
 					);
+					const readOptions = {
+						source: params.source ?? "recent",
+						lines: params.lines ?? 20,
+						raw: params.raw,
+					} as const;
+					const output =
+						target.kind === "agent"
+							? await readAgent(target.target, readOptions, signal)
+							: await readPane(target.pane.pane_id, readOptions, signal);
+					const label =
+						target.kind === "agent"
+							? target.alias || target.label
+							: target.alias || params.pane || target.pane.pane_id;
 
 					return {
 						content: [{ type: "text", text: formatReadOutput(output) }],
 						details: withSnapshot({
 							action: "read",
-							pane: resolved.alias || paneRef,
-							paneId: resolved.pane.pane_id,
+							targetKind: target.kind,
+							pane: label,
+							paneId: target.pane?.pane_id,
+							agent: target.kind === "agent" ? target.target : undefined,
 							source: params.source ?? "recent",
 						}),
 					};
@@ -900,11 +1058,16 @@ export default function (pi: ExtensionAPI) {
 					const updateTimer = onUpdate ? setInterval(publishWatchUpdate, 1000) : null;
 
 					try {
-						const args = ["wait", "output", resolved.pane.pane_id, "--match", match];
+						const args = [
+							"pane",
+							"wait-output",
+							resolved.pane.pane_id,
+							params.regex ? "--regex" : "--match",
+							match,
+						];
 						if (params.source) args.push("--source", params.source);
 						if (params.lines != null) args.push("--lines", String(params.lines));
 						if (params.timeout != null) args.push("--timeout", String(params.timeout));
-						if (params.regex) args.push("--regex");
 						if (params.raw) args.push("--raw");
 
 						const response = await execHerdrJson<{
@@ -945,56 +1108,56 @@ export default function (pi: ExtensionAPI) {
 
 					const resolvedPanes: Array<{ pane: PaneInfo; aliasOrRef: string }> = [];
 					for (const paneRef of paneRefs) {
-						throwIfAborted(signal, "wait_agent");
 						const resolved = await requirePaneRef(paneRef, signal);
-						resolvedPanes.push({
-							pane: resolved.pane,
-							aliasOrRef: resolved.alias || paneRef,
+						resolvedPanes.push({ pane: resolved.pane, aliasOrRef: resolved.alias || paneRef });
+					}
+
+					const startedAt = Date.now();
+					const publishWaitUpdate = () => onUpdate?.({
+						content: [{ type: "text", text: `Waiting for ${resolvedPanes.map((item) => item.aliasOrRef).join(", ")}...` }],
+						details: withSnapshot({
+							action: "wait_agent",
+							panes: resolvedPanes.map((item) => item.aliasOrRef),
+							statuses,
+							mode,
+							elapsed: Math.floor((Date.now() - startedAt) / 1000),
+						}),
+					});
+					publishWaitUpdate();
+					const updateTimer = onUpdate ? setInterval(publishWaitUpdate, 1000) : null;
+					const controllers = resolvedPanes.map(() => new AbortController());
+					const abortWaits = () => controllers.forEach((controller) => controller.abort(signal?.reason));
+					signal?.addEventListener("abort", abortWaits, { once: true });
+					try {
+						const waits = resolvedPanes.map((resolved, index) => {
+							const args = ["agent", "wait", resolved.pane.pane_id];
+							for (const status of statuses) args.push("--until", status);
+							if (params.timeout != null) args.push("--timeout", String(params.timeout));
+							return execHerdr(args, controllers[index]!.signal);
 						});
+						if (mode === "all") await Promise.all(waits);
+						else {
+							await Promise.any(waits);
+							controllers.forEach((controller) => controller.abort());
+						}
+					} finally {
+						if (updateTimer) clearInterval(updateTimer);
+						signal?.removeEventListener("abort", abortWaits);
+						controllers.forEach((controller) => controller.abort());
 					}
 
-					const deadline = params.timeout != null ? Date.now() + params.timeout : null;
-					let snapshot: Array<{
-						pane: string;
-						paneId: string;
-						status: AgentStatus;
-						agent?: string;
-					}> = [];
-
-					while (true) {
-						throwIfAborted(signal, "wait_agent");
-						snapshot = [];
-						for (const resolved of resolvedPanes) {
-							throwIfAborted(signal, "wait_agent");
-							const pane = await getPaneInfo(resolved.pane.pane_id, signal);
-							if (!pane) throw new Error(`Pane '${resolved.aliasOrRef}' no longer exists.`);
-							snapshot.push({
-								pane: resolved.aliasOrRef,
-								paneId: pane.pane_id,
-								status: pane.agent_status,
-								agent: pane.agent,
-							});
-						}
-
-						const satisfied =
-							mode === "all"
-								? snapshot.every((item) => statuses.includes(item.status))
-								: snapshot.some((item) => statuses.includes(item.status));
-						if (satisfied) break;
-						if (deadline != null && Date.now() >= deadline) {
-							throw new Error(
-								`Timed out waiting for panes [${snapshot.map((item) => item.pane).join(", ")}] to reach ${mode} of statuses '${formatStatusList(statuses)}'. Last statuses: ${snapshot.map((item) => `${item.pane}=${item.status}`).join(", ")}`,
-							);
-						}
-						await sleepWithSignal(250, signal);
-					}
-
+					const agents = await Promise.all(
+						resolvedPanes.map((resolved) => getAgentInfo(resolved.pane.pane_id, signal)),
+					);
+					const snapshot = agents.map((agent, index) => ({
+						pane: resolvedPanes[index]!.aliasOrRef,
+						paneId: agent.pane_id,
+						status: agent.agent_status,
+						agent: agentDisplayName(agent),
+					}));
 					const summary = snapshot.map((item) => `${item.pane}=${item.status}`).join(", ");
 					return {
-						content: [{
-							type: "text",
-							text: `wait_agent satisfied (${mode}: ${formatStatusList(statuses)})\n\n${summary}`,
-						}],
+						content: [{ type: "text", text: `wait_agent satisfied (${mode}: ${formatStatusList(statuses)})\n\n${summary}` }],
 						details: withSnapshot({
 							action: "wait_agent",
 							pane: paneRefs.length === 1 ? resolvedPanes[0]?.aliasOrRef : undefined,
@@ -1003,35 +1166,52 @@ export default function (pi: ExtensionAPI) {
 							status: paneRefs.length === 1 && statuses.length === 1 ? snapshot[0]?.status : undefined,
 							statuses,
 							mode,
-							agents: snapshot.map((item) => item.agent).filter(Boolean),
+							agents: snapshot.map((item) => item.agent),
 							snapshot,
+							elapsed: Math.floor((Date.now() - startedAt) / 1000),
 						}),
 					};
 				}
 
 				case "send": {
 					rejectUnexpectedParams("send", params, ["workspace", "tab"]);
-					const paneRef = params.pane;
-					if (!paneRef) throw new Error("'pane' is required for send");
 					if (!params.text && !params.keys) throw new Error("'text' or 'keys' is required for send");
-
-					const resolved = await requirePaneRef(paneRef, signal);
+					const target = await resolveControlTarget(
+						{ agent: params.agent, pane: params.pane },
+						signal,
+					);
+					const label =
+						target.kind === "agent"
+							? target.alias || target.label
+							: target.alias || params.pane || target.pane.pane_id;
 
 					if (params.text) {
-						await execHerdr(["pane", "send-text", resolved.pane.pane_id, params.text], signal);
+						// 0.7.5 has no agent send-text; literal text always uses the pane primitive.
+						const paneId = target.pane?.pane_id;
+						if (!paneId) throw new Error("Unable to resolve pane for send text");
+						await execHerdr(["pane", "send-text", paneId, params.text], signal);
 					}
 					if (params.keys) {
 						const keys = params.keys.split(/\s+/).filter(Boolean);
-						await execHerdr(["pane", "send-keys", resolved.pane.pane_id, ...keys], signal);
+						if (target.kind === "agent") {
+							await execHerdr(["agent", "send-keys", target.target, ...keys], signal);
+						} else {
+							await execHerdr(["pane", "send-keys", target.pane.pane_id, ...keys], signal);
+						}
 					}
 
 					const desc = [params.text && `"${params.text}"`, params.keys].filter(Boolean).join(" + ");
 					return {
-						content: [{ type: "text", text: `Sent ${desc} to pane '${resolved.alias || paneRef}'` }],
+						content: [{
+							type: "text",
+							text: `Sent ${desc} to ${target.kind} '${label}'`,
+						}],
 						details: withSnapshot({
 							action: "send",
-							pane: resolved.alias || paneRef,
-							paneId: resolved.pane.pane_id,
+							targetKind: target.kind,
+							pane: label,
+							paneId: target.pane?.pane_id,
+							agent: target.kind === "agent" ? target.target : undefined,
 							text: params.text,
 							keys: params.keys,
 						}),
@@ -1075,9 +1255,12 @@ export default function (pi: ExtensionAPI) {
 			if (args.tab) text += theme.fg("muted", ` ${args.tab}`);
 			if (args.pane) text += theme.fg("muted", ` ${args.pane}`);
 			if (args.agent) text += theme.fg("muted", ` ${args.agent}`);
+			if (args.name) text += theme.fg("muted", ` ${args.name}`);
+			if (args.kind) text += theme.fg("dim", ` (${args.kind})`);
 			if (Array.isArray(args.panes) && args.panes.length) text += theme.fg("muted", ` ${args.panes.join(",")}`);
 			if (args.direction) text += theme.fg("dim", ` › ${args.direction}`);
 			if (args.command) text += theme.fg("dim", ` › ${args.command}`);
+			if (args.prompt) text += theme.fg("dim", ` › ${args.prompt}`);
 			if (args.newPane) text += theme.fg("muted", ` ${args.newPane}`);
 			if (args.label) text += theme.fg("muted", ` “${args.label}”`);
 			if (args.match) text += theme.fg("dim", ` › ${args.match}`);
@@ -1124,6 +1307,17 @@ export default function (pi: ExtensionAPI) {
 					let text = theme.fg("accent", `▥ ${details.newPane || details.newPaneId}`);
 					text += theme.fg("dim", ` ‹ ${details.direction} from ${details.pane}`);
 					return new Text(text, 0, 0);
+				}
+				case "agent_start": {
+					const agent = details.agent as AgentInfo;
+					return new Text(`${statusDot(theme, agent.agent_status)} ${theme.fg("accent", agentDisplayName(agent))} ${theme.fg("dim", `started · ${agent.agent_status}`)}`, 0, 0);
+				}
+				case "agent_prompt": {
+					if (isPartial) {
+						return new Text(theme.fg("warning", `◌ waiting ${details.agentTarget || context.args?.agent || context.args?.pane || "agent"}`) + theme.fg("dim", ` (${details.elapsed ?? 0}s)`), 0, 0);
+					}
+					const agent = details.agent as AgentInfo;
+					return new Text(`${statusDot(theme, agent.agent_status)} ${theme.fg("accent", agentDisplayName(agent))} ${theme.fg("dim", agent.agent_status)}`, 0, 0);
 				}
 				case "run": {
 					let text = theme.fg("success", `▶ ${details.pane}`);

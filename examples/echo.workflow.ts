@@ -12,7 +12,7 @@ export default defineWorkflow({
     reply: agent({
       spawn: {
         name: "echo-agent",
-        // agent: "worker", // optional: load ~/.pi/agent/agents/worker.md defaults
+        // agent: "worker", // optional: load project/global agents/worker.md defaults
         // model: "anthropic/claude-sonnet-4-6",
         // tools: "read,bash,grep,find,ls",
         // cwd: process.cwd(),

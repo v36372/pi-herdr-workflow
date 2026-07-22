@@ -40,28 +40,43 @@ agent({
 })
 ```
 
-## Completion model
+Named agents resolve from `<workflow cwd>/.pi/agents/<name>.md` first, then
+`~/.pi/agent/agents/<name>.md` (or `$PI_CODING_AGENT_DIR/agents`). Explicit spawn
+fields override agent frontmatter defaults. Supported defaults are `model`,
+`thinking`, `tools`, `skill`/`skills`, and `cwd`; the markdown body follows the
+reference implementation's `system-prompt: append|replace` behavior, or is
+prepended to the task when that field is omitted.
 
-`/workflow` blocks on **`workflow_done` → `result.json`** (authoritative). herdr agent-status is only a wake-up so we do not busy-spin.
+`skills` is an eager comma-separated list, not merely a discovery filter. The
+executor uses Pi's `DefaultResourceLoader` for the child cwd, resolves each name,
+and prepends the same full `<skill ...>` blocks produced by `/skill:name` to the
+submitted task. An unknown agent or skill fails the node before Pi starts.
+
+## Orchestrator and completion model
+
+`/workflow <name>` sends a normal user turn instructing the main pi orchestrator to call the model-visible `workflow` tool. That tool executes the graph deterministically, stays pending for the whole run, and streams node/agent progress through tool updates. The orchestrator receives the final structured result and presents it after the tool returns.
+
+Agent nodes use Herdr **v0.7.5's live-agent facade**. `workflow_done` → `result.json` remains authoritative; the agent lifecycle is the server-owned wait signal.
 
 | Step | action |
 |---|---|
-| create run workspace | `workspace_create` |
-| pane per agent | root pane / `pane_split` |
-| start child | `pane run` (`pi -p -ne -e child … @task.md`) |
-| wait for finish | poll `result.json`; herdr `wait_agent` as wake-up |
+| create run workspace | `herdr workspace create` |
+| pane per agent | root pane / `herdr pane split` |
+| prepare child environment | source `agent-env.sh` in the pane shell |
+| start interactive child | `herdr agent start <name> --kind pi --pane <id> -- <pi args>` |
+| deliver and wait | `herdr agent prompt <name> <task> --wait` |
 | collect output | accept `result.json` from `workflow_done` |
-| show user | durable `pi.sendMessage` (survives `/reload`; not toast-only) |
+| update orchestrator | partial `workflow` tool results with elapsed time and current node |
 
 Per agent attempt under `~/.pi/agent/workflows/runs/<runId>/agents/<nodeId>/<attemptId>/`:
 
 | File | Writer | Purpose |
 |---|---|---|
-| `task.md` | orchestrator | full prompt |
+| `task.md` | orchestrator | exact submitted prompt, including agent role and preloaded skills |
 | `result.json` | child (`workflow_done`) | structured output |
-| `launch.sh` | orchestrator | short pane launch script |
+| `agent-env.sh` | orchestrator | environment inherited by the interactive child |
 
-Child extension registers `workflow_done` → write `result.json`. Orchestrator unblocks only when that file appears. Launch uses `pi -p` so the process can exit after the tool call. No exit-sidecar handshake.
+The child extension registers `workflow_done`, writes `result.json`, and returns a terminating tool result so pi settles. `herdr agent prompt --wait` then wakes the orchestrator. No exit-sidecar handshake or status polling is used.
 
 ## Install
 
@@ -70,13 +85,15 @@ pi install file:./pi-herdr-workflows
 # or from this directory after npm i
 ```
 
-Requires: pi ≥ 0.80, herdr on PATH, running inside a Herdr session for live dispatch.
+Requires: pi ≥ 0.80 and Herdr ≥ 0.7.5 on PATH, with pi running inside a Herdr session.
 
 ```bash
 /workflow list
 /workflow echo summarize this repo
 /workflow pause | resume | cancel
 ```
+
+The visible conversation flow is: user `/workflow` request → orchestrator `workflow` tool call → streaming progress → tool result → orchestrator presentation.
 
 ## Author a workflow
 
@@ -120,7 +137,7 @@ const result = await engine.run(myWorkflow, { task: "…" });
 await executor.dispose();
 ```
 
-Inject a fake `HerdrClient` via `new HerdrClient({ exec })` for tests.
+Inject a fake `HerdrClient` via `new HerdrClient({ exec })` for tests. CLI failures surface as typed `HerdrError` values with machine-readable `code` fields (`protocol_mismatch`, `agent_prompt_stalled`, `agent_not_running`, …).
 
 ## Herdr tool ownership
 
@@ -131,14 +148,15 @@ Disable the old install so you do not get two tools:
 mv ~/.pi/agent/extensions/pi-herdr ~/.pi/agent/extensions/pi-herdr.disabled
 ```
 
-`/workflow` and freeform `herdr` tool calls share the same herdr CLI surface. The slash command drives wait_agent in-process; the model can still call `herdr` for ad-hoc pane work.
+The deterministic `workflow` tool uses the same Herdr CLI as freeform `herdr` calls, but owns its run topology and lifecycle internally. The model can still call `herdr` for ad-hoc pane work. Agent-targeted `read`/`send` (keys) use `herdr agent read` / `herdr agent send-keys`; ordinary terminals keep pane primitives.
 
 ## Deliberate ceilings
 
-1. **Agent frontmatter merge** — spawn fields are passed through; full interactive-subagents agent-md resolution (session-mode, auto-exit, deny-tools) is not ported yet. Upgrade: copy their frontmatter loader into `src/herdr/agent-defaults.ts`.
-2. **Validation retry in-pane** — if `validate` rejects after the child already exited, the step fails. Upgrade: keep the pane open and `pane run` a reject prompt.
+1. **Workflow-owned lifecycle** — agent frontmatter fields for subagent spawning, session mode, auto-exit, and interactivity do not apply. Workflow agents are fresh ephemeral Pi sessions and must finish through `workflow_done`.
+2. **Bounded validation retry** — if `validate` rejects after `workflow_done`, the same live agent is re-prompted with the validation error. Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
 3. **No graph widget / viewer** — run bundles still write to disk; use `state.json` / `trace.ndjson` or reattach a viewer later.
-4. **Launch command** — default builds a `pi -e child/extension.ts` line; override with `buildLaunchCommand` for codex/claude/etc.
+4. **Agent kind** — workflow nodes currently start interactive pi agents. Override `buildAgentArgs` for pi arguments; supporting other agent kinds requires a compatible structured-result tool.
+5. **No `agent.view.*` / metadata-token integration** — Herdr 0.7.5 exposes `agent.view.set`/`agent.view.clear` only on the socket API (no CLI subcommand) and `pane`/`workspace report-metadata` as display-token writers that require host UI config (`$token` rows in `config.toml`). They do not improve workflow-run correctness or lifecycle waits, so this package intentionally does not wrap them or build a custom socket client for nominal coverage. Pane labels plus `workflow` tool progress remain the run-visibility surface.
 
 ## Layout
 

@@ -52,13 +52,13 @@ export type WorkflowEdge =
 export type AgentSpawnParams = {
   /** Display name / pane label. Defaults to the node id. */
   name?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
-  /** Agent definition name (e.g. scout, worker). Loads ~/.pi/agent/agents/<name>.md defaults. */
+  /** Agent definition name. Loads project `.pi/agents/<name>.md`, then global defaults. */
   agent?: string;
   /** Appended (or replaces, via agent frontmatter) system prompt. */
   systemPrompt?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
   /** Model override. */
   model?: string;
-  /** Comma-separated skill names. */
+  /** Comma-separated skill names eagerly expanded into the child task. */
   skills?: string;
   /** Comma-separated native tool names. */
   tools?: string;
@@ -335,9 +335,7 @@ export type AgentStepContract = {
   expectedOutput?: string;
   /** Absolute path the child must write accepted structured output to. */
   resultPath: string;
-  /** Absolute path for the exit sidecar (`resultPath` sibling `.exit` or session.exit). */
-  exitPath: string;
-  /** Artifact directory for this attempt (task, sysprompt, session, activity). */
+  /** Artifact directory for this attempt (task, agent-env, result). */
   artifactDir: string;
 };
 

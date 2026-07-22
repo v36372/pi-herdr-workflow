@@ -28,11 +28,11 @@ herdr --help
 Then print the relevant command group by running it without a subcommand:
 
 ```bash
+herdr agent
 herdr pane
 herdr workspace
 herdr worktree
 herdr tab
-herdr wait
 herdr terminal
 herdr notification
 herdr integration
@@ -73,13 +73,11 @@ herdr pane current --current
 herdr pane list --workspace "$HERDR_WORKSPACE_ID"
 ```
 
-## Control agents through panes
+## Choose pane or agent primitives
 
-An agent runs inside a pane. Use the pane ID as the control target for agents, shells, servers, tests, and logs. This keeps spawning, input, reads, waits, and cleanup on one stable control surface.
+Pane commands control raw terminals, shells, tests, servers, input, and output. Agent commands control a recognized coding agent occupying a pane. Use `agent start`, `agent prompt`, and `agent wait` when Herdr must validate identity and lifecycle state; do not use raw `pane run` to start or prompt an agent.
 
-Use workspace and tab commands for organization. Use worktree commands only when you intentionally want Herdr to create, open, or remove a Git checkout.
-
-Pane records expose `agent`, `agent_status`, and native session metadata when available. Agent status is `idle`, `working`, `blocked`, `done`, or `unknown`.
+Agent targets are a unique live agent name or the pane ID currently hosting that agent. Names must match `[a-z][a-z0-9_-]{0,31}` and are cleared when the occupant exits or is replaced. Agent status is `idle`, `working`, `blocked`, `done`, or `unknown`.
 
 `idle` and `done` are the same underlying semantic state with different attention state:
 
@@ -90,70 +88,41 @@ An agent that first opens at its prompt reports `idle`, including in a backgroun
 
 Focusing a pane, switching to its tab, or regaining outer terminal focus marks the visible tab as seen, so `done` becomes `idle`. Switching away does not turn an existing `idle` status into `done`; `done` is created by a later completion while the pane is unseen. With no foreground client, a new completion in the globally active tab is treated as seen while completions in background tabs still become `done`.
 
-## Start agents interactively
+## Start and coordinate an agent
 
-Default to a sibling pane in the current tab and current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests that topology or location.
-
-Honor a direction requested by the user. Otherwise inspect the caller pane's current rectangle:
+Default to a sibling pane in the current tab and current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests it. Inspect layout, split without focus, and preserve cwd:
 
 ```bash
 herdr pane layout --pane "$HERDR_PANE_ID"
+herdr pane split --current --direction right --cwd "$PWD" --no-focus
 ```
 
-Split a wide pane to the right and a narrow or tall pane down. Avoid repeated same-direction splits that would create unusably narrow columns or short rows. Keep the user's focus in the calling pane:
+Read the new pane ID from `.result.pane.pane_id`. The pane must be at an interactive shell prompt. Start and validate the requested agent with a strict unique name:
 
 ```bash
-herdr pane split --current --direction right --no-focus
+herdr agent start reviewer --kind codex --pane <returned-pane-id>
 ```
 
-Replace `right` with `down` when the layout calls for it.
-
-Read `result.pane.pane_id` from the JSON response. Give the pane a useful label, then start the requested agent by running only its normal executable so its interactive TUI opens:
+Pass native arguments only after `--`. `agent start` returns after the expected agent is detected and ready. Submit work atomically and wait for the first settled `idle`, `done`, or `blocked` signal:
 
 ```bash
-herdr pane rename <returned-pane-id> "reviewer"
-herdr pane run <returned-pane-id> "codex"
+herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000
 ```
 
-Use the executable that belongs to the requested agent:
-
-- Codex: `codex`
-- Claude Code: `claude`
-- pi: `pi`
-- OpenCode: `opencode`
-- OMP: `omp`
-
-Do not pass the task as an argv prompt by default. Do not add non-interactive flags. Only change the normal interactive launch when the user explicitly asks for a different launch mode or command.
-
-Inspect the pane after launch. If `agent_status` is not yet `idle`, wait for the idle transition. Once it is idle, submit the task with `pane run`:
+Use `--until` only for state-specific waits:
 
 ```bash
-herdr pane get <returned-pane-id>
-herdr wait agent-status <returned-pane-id> --status idle --timeout 30000
-herdr pane run <returned-pane-id> "Review the current diff and report only actionable findings."
+herdr agent wait reviewer --until blocked --timeout 120000
 ```
 
-Status waits match the current status immediately or wait for a future matching transition.
-
-`pane run` sends the text and Enter together. Use it for initial prompts and follow-ups instead of coordinating `send-text` and `send-keys` separately.
-
-For normal background work, wait for the agent to start working. If the pane remains in a background tab or workspace, wait for `done` before reading its transcript:
+Without `--until`, `agent wait` matches `idle`, `done`, or `blocked`. Read through the agent facade:
 
 ```bash
-herdr wait agent-status <returned-pane-id> --status working --timeout 30000
-herdr wait agent-status <returned-pane-id> --status done --timeout 120000
-herdr pane read <returned-pane-id> --source recent-unwrapped --lines 120
+herdr agent get reviewer
+herdr agent read reviewer --source recent-unwrapped --lines 120
 ```
 
-If the user is watching that tab, completion reports `idle` instead, so wait for `idle`. Always treat either `idle` or `done` as completed when inspecting `pane get`; the difference is whether the result has been seen.
-
-If a wait times out, inspect `herdr pane get <returned-pane-id>` and `pane read` before deciding what to do. A `blocked` agent needs input; an `unknown` pane may not yet contain a detected or integrated agent.
-
-Submit follow-ups the same way:
-
-```bash
-herdr pane run <returned-pane-id> "Now check the failing test."
-```
+If a wait fails or returns `blocked`, inspect `agent get` and `agent read` before deciding what input to send. Use `herdr agent send-keys reviewer esc` for logical interactive controls.
 
 ## Run an ordinary command in another pane
 
@@ -167,7 +136,7 @@ Read the new `pane_id` from the JSON response, then run and inspect the command:
 
 ```bash
 herdr pane run <returned-pane-id> "just test"
-herdr wait output <returned-pane-id> --match "test result" --timeout 120000
+herdr pane wait-output <returned-pane-id> --match "test result" --timeout 120000
 herdr pane read <returned-pane-id> --source recent-unwrapped --lines 120
 ```
 

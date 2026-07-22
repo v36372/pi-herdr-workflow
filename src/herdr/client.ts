@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 export type HerdrJsonEnvelope = {
   result?: unknown;
   error?: { code?: string; message?: string };
+  id?: string;
 };
 
 export type HerdrExecResult = {
@@ -17,6 +18,31 @@ export type HerdrClientOptions = {
   /** Injected for tests. Defaults to spawning the binary. */
   exec?: (args: string[], signal?: AbortSignal) => Promise<HerdrExecResult>;
 };
+
+/** Machine-readable Herdr CLI/server failure with preserved error code. */
+export class HerdrError extends Error {
+  readonly code: string;
+  readonly args: string[];
+  readonly exitCode: number | null;
+  readonly id?: string;
+
+  constructor(
+    code: string,
+    message: string,
+    options: { args?: string[]; exitCode?: number | null; id?: string; cause?: unknown } = {},
+  ) {
+    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "HerdrError";
+    this.code = code;
+    this.args = options.args ?? [];
+    this.exitCode = options.exitCode ?? null;
+    if (options.id !== undefined) this.id = options.id;
+  }
+}
+
+export function isHerdrError(error: unknown): error is HerdrError {
+  return error instanceof HerdrError;
+}
 
 /**
  * Thin typed wrapper over the herdr CLI. Uses `--json`-friendly subcommands
@@ -36,8 +62,14 @@ export class HerdrClient {
     if (signal?.aborted) {
       throw abortError(signal);
     }
+    // Herdr may emit a JSON error envelope with exit 0. Detect only parseable
+    // `{ error: ... }` envelopes so ordinary text output (agent read) is kept.
+    const envelope = findHerdrErrorEnvelope(result);
+    if (envelope) {
+      throw herdrEnvelopeError(args, envelope, result.code);
+    }
     if (result.code !== 0) {
-      throw new Error(parseHerdrError(result) || `herdr ${args.join(" ")} failed (${result.code})`);
+      throw herdrFailure(args, result);
     }
     return result;
   }
@@ -46,16 +78,24 @@ export class HerdrClient {
     const result = await this.exec(args, signal);
     const stdout = result.stdout.trim();
     if (!stdout) {
-      throw new Error(`Expected JSON from herdr ${args.join(" ")}`);
+      throw new HerdrError(
+        "invalid_response",
+        `Expected JSON from herdr ${args.join(" ")}`,
+        { args, exitCode: result.code },
+      );
     }
     let value: HerdrJsonEnvelope;
     try {
       value = JSON.parse(stdout) as HerdrJsonEnvelope;
-    } catch {
-      throw new Error(`Failed to parse JSON from herdr ${args.join(" ")}`);
+    } catch (cause) {
+      throw new HerdrError(
+        "invalid_response",
+        `Failed to parse JSON from herdr ${args.join(" ")}`,
+        { args, exitCode: result.code, cause },
+      );
     }
     if (value.error) {
-      throw new Error(value.error.message || value.error.code || `herdr ${args.join(" ")} failed`);
+      throw herdrEnvelopeError(args, value, result.code);
     }
     return value as T;
   }
@@ -129,94 +169,108 @@ export class HerdrClient {
     await this.exec(["pane", "send-text", paneId, text], signal);
   }
 
+  async paneSendKeys(paneId: string, keys: string[], signal?: AbortSignal): Promise<void> {
+    await this.exec(["pane", "send-keys", paneId, ...keys], signal);
+  }
+
   async paneClose(paneId: string, signal?: AbortSignal): Promise<void> {
     await this.exec(["pane", "close", paneId], signal);
   }
 
-  /**
-   * Block until herdr reports the pane/agent at `status`.
-   * Same primitive the `herdr` tool's `wait_agent` action uses
-   * (`herdr wait agent-status`).
-   */
+  async agentStart(
+    options: {
+      name: string;
+      kind: string;
+      paneId: string;
+      args?: string[];
+      timeoutMs?: number;
+    },
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const args = [
+      "agent",
+      "start",
+      options.name,
+      "--kind",
+      options.kind,
+      "--pane",
+      options.paneId,
+    ];
+    if (options.timeoutMs !== undefined) {
+      args.push("--timeout", String(options.timeoutMs));
+    }
+    if (options.args?.length) args.push("--", ...options.args);
+    await this.exec(args, signal);
+  }
+
+  async agentGet(
+    target: string,
+    signal?: AbortSignal,
+  ): Promise<{ agent_status: "idle" | "working" | "blocked" | "unknown" | "done" }> {
+    const response = await this.json<{
+      result: {
+        agent: {
+          agent_status: "idle" | "working" | "blocked" | "unknown" | "done";
+        };
+      };
+    }>(["agent", "get", target], signal);
+    return response.result.agent;
+  }
+
+  async agentRead(
+    target: string,
+    options: { source?: string; lines?: number; raw?: boolean } = {},
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const args = ["agent", "read", target];
+    if (options.source) args.push("--source", options.source);
+    if (options.lines != null) args.push("--lines", String(options.lines));
+    if (options.raw) args.push("--ansi");
+    return (await this.exec(args, signal)).stdout;
+  }
+
+  async agentSendKeys(target: string, keys: string[], signal?: AbortSignal): Promise<void> {
+    await this.exec(["agent", "send-keys", target, ...keys], signal);
+  }
+
+  async agentPrompt(
+    target: string,
+    text: string,
+    options: {
+      wait?: boolean;
+      until?: Array<"idle" | "working" | "blocked" | "unknown" | "done">;
+      timeoutMs?: number;
+    } = {},
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const args = ["agent", "prompt", target, text];
+    if (options.wait) args.push("--wait");
+    for (const status of options.until ?? []) args.push("--until", status);
+    if (options.timeoutMs !== undefined) {
+      args.push("--timeout", String(options.timeoutMs));
+    }
+    await this.exec(args, signal);
+  }
+
   async agentWait(
     target: string,
-    status: "idle" | "working" | "blocked" | "unknown" | "done",
+    statuses: Array<"idle" | "working" | "blocked" | "unknown" | "done">,
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<void> {
-    await this.exec(
-      [
-        "wait",
-        "agent-status",
-        target,
-        "--status",
-        status,
-        "--timeout",
-        String(timeoutMs),
-      ],
-      signal,
-    );
+    const args = ["agent", "wait", target];
+    for (const status of statuses) args.push("--until", status);
+    args.push("--timeout", String(timeoutMs));
+    await this.exec(args, signal);
   }
 
-  /**
-   * wait_agent-style: accept any of several terminal statuses.
-   * Mirrors pi-herdr tool `wait_agent` with statuses=[idle,done].
-   */
   async waitAgent(
     target: string,
     statuses: Array<"idle" | "working" | "blocked" | "unknown" | "done">,
     timeoutMs: number,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (statuses.length === 0) {
-      throw new Error("waitAgent requires at least one status");
-    }
-    if (statuses.length === 1) {
-      await this.agentWait(target, statuses[0]!, timeoutMs, signal);
-      return;
-    }
-    // herdr CLI takes one --status; race one waiter per accepted status.
-    const deadline = Date.now() + timeoutMs;
-    const errors: unknown[] = [];
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const controllers = statuses.map(() => new AbortController());
-      const onParentAbort = () => {
-        for (const c of controllers) c.abort(signal?.reason);
-      };
-      signal?.addEventListener("abort", onParentAbort, { once: true });
-
-      const finishOk = () => {
-        if (settled) return;
-        settled = true;
-        signal?.removeEventListener("abort", onParentAbort);
-        for (const c of controllers) c.abort();
-        resolve();
-      };
-      const finishErr = (error: unknown) => {
-        errors.push(error);
-        if (errors.length < statuses.length) return;
-        if (settled) return;
-        settled = true;
-        signal?.removeEventListener("abort", onParentAbort);
-        reject(
-          signal?.aborted
-            ? abortError(signal)
-            : new Error(
-                `Timed out waiting for ${target} to reach one of [${statuses.join(", ")}]`,
-              ),
-        );
-      };
-
-      for (let i = 0; i < statuses.length; i++) {
-        const status = statuses[i]!;
-        const remaining = Math.max(1, deadline - Date.now());
-        this.agentWait(target, status, remaining, controllers[i]!.signal).then(
-          finishOk,
-          finishErr,
-        );
-      }
-    });
+    await this.agentWait(target, statuses, timeoutMs, signal);
   }
 
   async waitOutput(
@@ -225,28 +279,67 @@ export class HerdrClient {
     options: { regex?: boolean; timeoutMs?: number; source?: string } = {},
     signal?: AbortSignal,
   ): Promise<void> {
-    const args = ["wait", "output", paneId, "--match", match];
-    if (options.regex) args.push("--regex");
+    const args = [
+      "pane",
+      "wait-output",
+      paneId,
+      options.regex ? "--regex" : "--match",
+      match,
+    ];
     if (options.timeoutMs !== undefined) args.push("--timeout", String(options.timeoutMs));
     if (options.source) args.push("--source", options.source);
     await this.exec(args, signal);
   }
 }
 
-function parseHerdrError(result: HerdrExecResult): string | null {
+/** Return a parseable Herdr error envelope from stdout/stderr, if present. */
+function findHerdrErrorEnvelope(result: HerdrExecResult): HerdrJsonEnvelope | null {
   for (const raw of [result.stderr, result.stdout]) {
     const trimmed = raw.trim();
     if (!trimmed) continue;
     try {
       const value = JSON.parse(trimmed) as HerdrJsonEnvelope;
-      if (value.error?.message || value.error?.code) {
-        return value.error.message || value.error.code || null;
+      if (value && typeof value === "object" && value.error) {
+        return value;
       }
     } catch {
-      return trimmed;
+      // Not JSON — leave for callers that treat non-zero exits as plain text.
     }
   }
   return null;
+}
+
+function herdrFailure(args: string[], result: HerdrExecResult): HerdrError {
+  for (const raw of [result.stderr, result.stdout]) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    return new HerdrError("command_failed", trimmed, {
+      args,
+      exitCode: result.code,
+    });
+  }
+  return new HerdrError(
+    "command_failed",
+    `herdr ${args.join(" ")} failed (${result.code})`,
+    { args, exitCode: result.code },
+  );
+}
+
+function herdrEnvelopeError(
+  args: string[],
+  value: HerdrJsonEnvelope,
+  exitCode: number | null,
+): HerdrError {
+  const code = value.error?.code?.trim() || "command_failed";
+  const message =
+    value.error?.message?.trim() ||
+    value.error?.code?.trim() ||
+    `herdr ${args.join(" ")} failed`;
+  return new HerdrError(code, message, {
+    args,
+    exitCode,
+    ...(value.id ? { id: value.id } : {}),
+  });
 }
 
 function abortError(signal?: AbortSignal): Error {
