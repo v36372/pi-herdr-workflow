@@ -2,7 +2,7 @@
   "name": "pi-herdr-workflows",
   "version": "0.1.0",
   "private": true,
-  "description": "Workflow engine for pi with Herdr pane dispatch, herdr tool, and subagent-style agent params",
+  "description": "Workflow engine for pi with Herdr pane dispatch, vendored herdr_layout/pane/agent tools, and subagent-style agent params",
   "keywords": [
     "pi-package",
     "workflow",

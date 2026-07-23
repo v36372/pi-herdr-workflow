@@ -127,6 +127,50 @@ export class HerdrClient {
     await this.exec(["workspace", "close", workspaceId], signal);
   }
 
+  async workspaceFocus(workspaceId: string, signal?: AbortSignal): Promise<void> {
+    await this.exec(["workspace", "focus", workspaceId], signal);
+  }
+
+  async tabFocus(tabId: string, signal?: AbortSignal): Promise<void> {
+    await this.exec(["tab", "focus", tabId], signal);
+  }
+
+  async tabCreate(
+    options: {
+      workspaceId?: string;
+      cwd?: string;
+      label?: string;
+      focus?: boolean;
+    } = {},
+    signal?: AbortSignal,
+  ): Promise<{ tab_id: string; pane_id?: string; workspace_id?: string }> {
+    const args = ["tab", "create"];
+    if (options.workspaceId) args.push("--workspace", options.workspaceId);
+    if (options.cwd) args.push("--cwd", options.cwd);
+    if (options.label) args.push("--label", options.label);
+    args.push(options.focus ? "--focus" : "--no-focus");
+    const response = await this.json<{
+      result: {
+        tab: { tab_id: string; workspace_id?: string };
+        root_pane?: { pane_id: string };
+        pane?: { pane_id: string };
+      };
+    }>(args, signal);
+    const paneId =
+      response.result.root_pane?.pane_id ?? response.result.pane?.pane_id;
+    return {
+      tab_id: response.result.tab.tab_id,
+      ...(paneId ? { pane_id: paneId } : {}),
+      ...(response.result.tab.workspace_id
+        ? { workspace_id: response.result.tab.workspace_id }
+        : {}),
+    };
+  }
+
+  async tabClose(tabId: string, signal?: AbortSignal): Promise<void> {
+    await this.exec(["tab", "close", tabId], signal);
+  }
+
   async paneList(workspaceId: string, signal?: AbortSignal): Promise<Array<{ pane_id: string }>> {
     const response = await this.json<{ result: { panes: Array<{ pane_id: string }> } }>(
       ["pane", "list", "--workspace", workspaceId],

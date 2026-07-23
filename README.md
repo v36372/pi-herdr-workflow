@@ -6,7 +6,7 @@ One package that composes three ideas:
 |---|---|---|
 | **pi-workflows** | graph engine, node types, edges, run bundles | graph widget, conversation-step executor, terminal viewer |
 | **pi-interactive-subagents** | agent spawn params + result-file protocol | mux tools, `/plan` `/iterate`, status widget, actual dispatch |
-| **pi-herdr** | pane/workspace dispatch **and** the `herdr` tool (forked in) | separate package install (disable `~/.pi/agent/extensions/pi-herdr`) |
+| **pi-herdr** | pane/workspace dispatch **and** interactive tools vendored from `@ogulcancelik/pi-herdr` (`herdr_layout` / `herdr_pane` / `herdr_agent`) | separate package install (disable `~/.pi/agent/extensions/pi-herdr`) |
 
 ## What runs where
 
@@ -141,14 +141,19 @@ Inject a fake `HerdrClient` via `new HerdrClient({ exec })` for tests. CLI failu
 
 ## Herdr tool ownership
 
-This package registers the `herdr` tool (source: `src/herdr/tool.ts`, skill: `skills/herdr/`).
-Disable the old install so you do not get two tools:
+This package vendors the interactive tools from `@ogulcancelik/pi-herdr` (source: `src/herdr/tool.ts`, skill: `skills/herdr/`):
+
+- `herdr_layout` — workspaces, tabs, pane topology
+- `herdr_pane` — ordinary commands and raw terminal control
+- `herdr_agent` — start/prompt/wait/read recognized coding agents
+
+Disable a separate install so you do not register the same tools twice:
 
 ```bash
 mv ~/.pi/agent/extensions/pi-herdr ~/.pi/agent/extensions/pi-herdr.disabled
 ```
 
-The deterministic `workflow` tool uses the same Herdr CLI as freeform `herdr` calls, but owns its run topology and lifecycle internally. The model can still call `herdr` for ad-hoc pane work. Agent-targeted `read`/`send` (keys) use `herdr agent read` / `herdr agent send-keys`; ordinary terminals keep pane primitives.
+The deterministic `workflow` tool uses `HerdrClient` / `HerdrStepExecutor` and owns its run topology and lifecycle internally. Freeform pane and agent work goes through the three interactive tools above.
 
 ## Deliberate ceilings
 
@@ -163,7 +168,7 @@ The deterministic `workflow` tool uses the same Herdr CLI as freeform `herdr` ca
 ```
 src/
   workflows/     # forked engine (no UI)
-  herdr/         # client + HerdrStepExecutor + result-file protocol
+  herdr/         # vendored interactive tools + client + HerdrStepExecutor + result-file protocol
   child/         # workflow_done extension for agent panes
   extension/     # thin /workflow command (no widget)
 ```

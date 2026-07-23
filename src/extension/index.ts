@@ -18,19 +18,19 @@ import {
 } from "../workflows/index.js";
 import { HerdrStepExecutor, type HerdrAgentWaitProgress } from "../herdr/executor.js";
 import registerHerdrTool from "../herdr/tool.js";
+import {
+  buildNodeProgress,
+  formatElapsed,
+  formatProgressText,
+  formatProgressThemed,
+  type WorkflowProgressSnapshot,
+} from "./progress.js";
 
-type WorkflowToolDetails = {
-  phase: "starting" | "running" | "completed" | "waiting" | "failed";
-  workflowName: string;
-  message: string;
-  elapsedMs: number;
-  nodeId?: string;
-  agentName?: string;
-  paneId?: string;
+const WORKFLOW_WIDGET_KEY = "pi-herdr-workflows";
+
+type WorkflowToolDetails = WorkflowProgressSnapshot & {
   completedSteps?: number;
-  status?: WorkflowRunState["status"];
   runId?: string;
-  runDir?: string;
   outputs?: Record<string, unknown>;
   finalOutput?: unknown;
   presentationPrompt?: string;
@@ -68,35 +68,72 @@ export default function (pi: ExtensionAPI) {
       const workflow = await loadWorkflowFile(resolved.path);
       const runSignal = signal ?? new AbortController().signal;
       const startedAt = Date.now();
+      let latestState: WorkflowRunState | undefined;
       let latest: WorkflowToolDetails = {
         phase: "starting",
         workflowName: workflow.name,
         message: `Loading ${path.resolve(resolved.path)}`,
         elapsedMs: 0,
+        nodes: buildNodeProgress({ workflow, phase: "starting" }),
       };
 
       const publish = (patch: Partial<WorkflowToolDetails>) => {
-        latest = { ...latest, ...patch, elapsedMs: Date.now() - startedAt };
+        latest = {
+          ...latest,
+          ...patch,
+          elapsedMs: Date.now() - startedAt,
+          nodes:
+            patch.nodes ??
+            buildNodeProgress({
+              workflow,
+              state: latestState,
+              currentNodeId: patch.currentNodeId ?? latest.currentNodeId,
+              phase: patch.phase ?? latest.phase,
+            }),
+        };
+        const text = formatProgressText(latest);
         onUpdate?.({
-          content: [{ type: "text", text: formatProgress(latest) }],
+          content: [{ type: "text", text }],
           details: latest,
         });
+        // Sticky live view above the editor; tool partial is the chat record.
+        if (ctx.hasUI) {
+          ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, text.split("\n"));
+        }
       };
       const onTrace = (event: WorkflowTraceEvent, state: WorkflowRunState) => {
-        publish(traceProgress(event, state));
+        latestState = state;
+        publish(traceProgress(event, state, workflow));
       };
       const onAgentProgress = (event: HerdrAgentWaitProgress) => {
+        // Keep pane/agent ids for details, but don't surface raw herdr CLI text.
+        // The one-liner comes from the node's statusDetail (or spawn.name).
+        const message =
+          event.phase === "blocked"
+            ? "waiting for input"
+            : event.phase === "validation_retry"
+              ? "retrying invalid output"
+              : undefined;
         publish({
           phase: "running",
-          nodeId: event.nodeId,
+          currentNodeId: event.nodeId,
           agentName: event.agentName,
           paneId: event.paneId,
-          message: event.message,
+          ...(message ? { message } : {}),
         });
       };
 
       activeExecutor = new HerdrStepExecutor({
         cwd: ctx.cwd,
+        // Capture the orchestrator location before any agent step can steal focus.
+        // Closing the run workspace without restoring first can land Herdr on an
+        // unrelated empty workspace.
+        originFocus: {
+          ...(process.env.HERDR_WORKSPACE_ID
+            ? { workspaceId: process.env.HERDR_WORKSPACE_ID }
+            : {}),
+          ...(process.env.HERDR_TAB_ID ? { tabId: process.env.HERDR_TAB_ID } : {}),
+        },
         closeWorkspaceOnDispose: true,
         onProgress: onAgentProgress,
       });
@@ -104,19 +141,30 @@ export default function (pi: ExtensionAPI) {
       running = true;
       const onAbort = () => activeEngine?.cancel();
       runSignal.addEventListener("abort", onAbort, { once: true });
-      const ticker = onUpdate
-        ? setInterval(() => publish({ message: latest.message }), 1_000)
+      // Tick so elapsed time stays fresh while a node is waiting on Herdr.
+      const ticker = onUpdate || ctx.hasUI
+        ? setInterval(() => publish({}), 1_000)
         : undefined;
 
       try {
-        publish({ phase: "running", message: `Starting workflow ${workflow.name}` });
+        publish({
+          phase: "running",
+          message: `Starting workflow ${workflow.name}`,
+        });
         const result = await activeEngine.run(workflow, params.input ?? null, {
           workflowPath: path.resolve(resolved.path),
         });
+        latestState = result.state;
         const presentationPrompt = await resolvePresentationPrompt(workflow, result.state, runSignal);
+        const phase =
+          result.state.status === "completed"
+            ? "completed"
+            : result.state.status === "waiting"
+              ? "waiting"
+              : "failed";
         const finalDetails: WorkflowToolDetails = {
           ...latest,
-          phase: result.state.status === "completed" ? "completed" : result.state.status === "waiting" ? "waiting" : "failed",
+          phase,
           status: result.state.status,
           runId: result.state.runId,
           runDir: result.runDir,
@@ -126,7 +174,14 @@ export default function (pi: ExtensionAPI) {
           message: `Workflow ${workflow.name} ${result.state.status}`,
           elapsedMs: Date.now() - startedAt,
           completedSteps: result.state.steps.length,
+          currentNodeId: result.state.currentNode ?? result.state.waitingOn,
+          nodes: buildNodeProgress({
+            workflow,
+            state: result.state,
+            phase,
+          }),
         };
+        latest = finalDetails;
         if (result.state.status === "failed" || result.state.status === "timed_out" || result.state.status === "cancelled") {
           throw new Error(
             `${finalDetails.message}${result.state.error ? `: ${result.state.error}` : ""}\nrunDir: ${result.runDir}`,
@@ -140,6 +195,9 @@ export default function (pi: ExtensionAPI) {
         if (ticker) clearInterval(ticker);
         runSignal.removeEventListener("abort", onAbort);
         running = false;
+        if (ctx.hasUI) {
+          ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, undefined);
+        }
         try {
           await activeExecutor?.dispose();
         } finally {
@@ -158,27 +216,21 @@ export default function (pi: ExtensionAPI) {
       return component;
     },
 
-    renderResult(result, { isPartial, expanded }, theme) {
+    renderResult(result, { isPartial, expanded }, theme, context) {
       const details = result.details as WorkflowToolDetails | undefined;
+      const component = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       if (!details) {
         const content = result.content?.[0];
-        return new Text(content?.type === "text" ? content.text : "", 0, 0);
+        component.setText(content?.type === "text" ? content.text : "");
+        return component;
       }
-      if (isPartial) {
-        const node = details.nodeId ? ` · ${details.nodeId}` : "";
-        return new Text(
-          theme.fg(details.phase === "failed" ? "error" : "warning", "◌ ") +
-            theme.fg("accent", details.workflowName) +
-            theme.fg("dim", `${node} · ${formatElapsed(details.elapsedMs)}\n${details.message}`),
-          0,
-          0,
-        );
+      // Live + settled both show the full node list; final adds runDir when expanded.
+      let text = formatProgressThemed(details, theme);
+      if (!isPartial && expanded && details.runDir) {
+        text += `\n${theme.fg("dim", details.runDir)}`;
       }
-      let text = theme.fg(details.phase === "completed" ? "success" : "warning", "✓ ") +
-        theme.fg("accent", details.workflowName) +
-        theme.fg("dim", ` · ${details.status ?? details.phase} · ${formatElapsed(details.elapsedMs)}`);
-      if (expanded && details.runDir) text += `\n${theme.fg("dim", details.runDir)}`;
-      return new Text(text, 0, 0);
+      component.setText(text);
+      return component;
     },
   });
 
@@ -254,35 +306,56 @@ function parseInvocation(raw: string): { name: string; input: unknown } {
 function traceProgress(
   event: WorkflowTraceEvent,
   state: WorkflowRunState,
+  workflow: WorkflowDefinition,
 ): Partial<WorkflowToolDetails> {
+  const base = {
+    completedSteps: state.steps.length,
+    currentNodeId: state.currentNode ?? state.waitingOn,
+    status: state.status,
+    nodes: buildNodeProgress({
+      workflow,
+      state,
+      phase:
+        event.type === "node_failed"
+          ? "failed"
+          : state.status === "waiting"
+            ? "waiting"
+            : "running",
+    }),
+  } satisfies Partial<WorkflowToolDetails>;
+
   switch (event.type) {
-    case "node_started":
+    case "node_started": {
+      const node = workflow.nodes[event.nodeId ?? ""];
+      const detail =
+        (typeof node?.statusDetail === "string" && node.statusDetail.trim()) ||
+        (node?.nodeType === "agent" && typeof node.spawn?.name === "string"
+          ? node.spawn.name
+          : undefined);
       return {
+        ...base,
         phase: "running",
-        nodeId: event.nodeId,
-        message: `Starting ${event.payload.nodeType} node ${event.nodeId}`,
-        completedSteps: state.steps.length,
+        message: detail ?? `Running ${event.nodeId}`,
       };
+    }
     case "node_finished":
       return {
+        ...base,
         phase: "running",
-        nodeId: event.nodeId,
-        message: `Finished node ${event.nodeId}`,
-        completedSteps: state.steps.length,
+        message: "",
       };
     case "node_failed":
       return {
+        ...base,
         phase: "failed",
-        nodeId: event.nodeId,
-        message: `Node ${event.nodeId} failed: ${String(event.payload.error ?? "unknown")}`,
-        completedSteps: state.steps.length,
+        message: `Failed: ${String(event.payload.error ?? "unknown")}`,
       };
     case "run_paused":
-      return { phase: "waiting", message: "Workflow paused at a step boundary" };
+      return { ...base, phase: "waiting", message: "Workflow paused at a step boundary" };
     case "run_resumed":
-      return { phase: "running", message: "Workflow resumed" };
+      return { ...base, phase: "running", message: "Workflow resumed" };
     default:
-      return { completedSteps: state.steps.length };
+      return base;
   }
 }
 
@@ -299,15 +372,12 @@ async function resolvePresentationPrompt(
   });
 }
 
-function formatProgress(details: WorkflowToolDetails): string {
-  const node = details.nodeId ? ` · node ${details.nodeId}` : "";
-  return `${details.workflowName}${node} · ${formatElapsed(details.elapsedMs)}\n${details.message}`;
-}
-
 function formatFinalResult(details: WorkflowToolDetails): string {
   const body = [
     `Workflow ${details.workflowName} ${details.status}`,
     details.presentationPrompt ? `Presentation instructions: ${details.presentationPrompt}` : undefined,
+    "",
+    formatProgressText(details),
     "",
     "Final output:",
     JSON.stringify(details.finalOutput ?? details.outputs ?? null, null, 2),
@@ -323,8 +393,4 @@ function formatFinalResult(details: WorkflowToolDetails): string {
   return truncated.truncated
     ? `${truncated.content}\n\n[Output truncated; full state is in ${details.runDir}/state.json]`
     : truncated.content;
-}
-
-function formatElapsed(elapsedMs: number): string {
-  return `${Math.floor(elapsedMs / 1_000)}s`;
 }

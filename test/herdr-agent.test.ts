@@ -62,6 +62,7 @@ test("executor starts and prompts pi through Herdr 0.7.5 agent facade", async ()
     },
   });
   const executor = new HerdrStepExecutor({
+    originFocus: {},
     client,
     cwd: root,
     onProgress: (event) => progress.push(event.phase),
@@ -154,7 +155,11 @@ test("executor merges named agent defaults and preloads requested skills", async
       return okJson();
     },
   });
-  const executor = new HerdrStepExecutor({ client, cwd: root });
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+  });
 
   try {
     const submission = await executor.runAgentStep(
@@ -256,6 +261,7 @@ test("executor re-prompts the same agent on validation failure and clears stale 
     },
   });
   const executor = new HerdrStepExecutor({
+    originFocus: {},
     client,
     cwd: root,
     maxValidationAttempts: 3,
@@ -328,6 +334,7 @@ test("executor fails after the validation attempt ceiling", async () => {
     },
   });
   const executor = new HerdrStepExecutor({
+    originFocus: {},
     client,
     cwd: root,
     maxValidationAttempts: 2,
@@ -449,7 +456,11 @@ test("executor maps actionable Herdr error codes", async () => {
       return okJson();
     },
   });
-  const executor = new HerdrStepExecutor({ client, cwd: root });
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+  });
 
   try {
     await assert.rejects(
@@ -510,4 +521,135 @@ test("clearResultFile removes rejected payloads", () => {
   assert.equal(readResultFile(resultPath), null);
   clearResultFile(resultPath); // idempotent
   rmSync(root, { recursive: true, force: true });
+});
+
+test("dispose closes a run tab in the origin workspace without workspace.close", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-dispose-tab-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const calls: string[][] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "tab" && args[1] === "create") {
+        return okJson({
+          tab: { tab_id: "w-origin:t-run", workspace_id: "w-origin" },
+          root_pane: { pane_id: "w-origin:p-run" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-1",
+          nodeId: "review",
+          attemptId: "12345678-abcd",
+          output: { ok: true },
+        });
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    client,
+    cwd: root,
+    originFocus: { workspaceId: "w-origin", tabId: "w-origin:t1" },
+    closeWorkspaceOnDispose: true,
+  });
+
+  try {
+    await executor.runAgentStep(
+      {
+        contract: baseContract(artifactDir, resultPath),
+        prompt: "do work",
+        spawn: { name: "worker", tools: "read", fork: false },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+    await executor.dispose();
+
+    assert.equal(
+      calls.some((args) => args[0] === "workspace" && args[1] === "create"),
+      false,
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "workspace" && args[1] === "close"),
+      false,
+    );
+    const layoutCalls = calls.filter(
+      (args) =>
+        (args[0] === "tab" && args[1] === "create") ||
+        (args[0] === "workspace" && args[1] === "focus") ||
+        (args[0] === "tab" && args[1] === "focus") ||
+        (args[0] === "tab" && args[1] === "close"),
+    );
+    // Host in origin workspace tab; restore after step; restore then close tab.
+    assert.deepEqual(layoutCalls, [
+      ["tab", "create", "--workspace", "w-origin", "--cwd", root, "--label", "wf:run-1", "--no-focus"],
+      ["workspace", "focus", "w-origin"],
+      ["tab", "focus", "w-origin:t1"],
+      ["workspace", "focus", "w-origin"],
+      ["tab", "focus", "w-origin:t1"],
+      ["tab", "close", "w-origin:t-run"],
+    ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dispose restores origin focus before and after fallback workspace.close", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-dispose-ws-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const calls: string[][] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w-run" },
+          root_pane: { pane_id: "w-run:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-1",
+          nodeId: "review",
+          attemptId: "12345678-abcd",
+          output: { ok: true },
+        });
+      }
+      return okJson();
+    },
+  });
+  // No origin workspace => fallback separate run workspace.
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+    closeWorkspaceOnDispose: true,
+  });
+
+  try {
+    await executor.runAgentStep(
+      {
+        contract: baseContract(artifactDir, resultPath),
+        prompt: "do work",
+        spawn: { name: "worker", tools: "read", fork: false },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+    await executor.dispose();
+
+    const close = calls.find((args) => args[0] === "workspace" && args[1] === "close");
+    assert.deepEqual(close, ["workspace", "close", "w-run"]);
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "create"),
+      false,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

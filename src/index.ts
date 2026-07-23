@@ -7,10 +7,11 @@ export {
 } from "./herdr/executor.js";
 export type {
   HerdrAgentWaitProgress,
+  HerdrOriginFocus,
   HerdrStepExecutorOptions,
   AgentStartContext,
 } from "./herdr/executor.js";
-/** Forked herdr tool (was @ogulcancelik/pi-herdr). */
+/** Vendored interactive tools from @ogulcancelik/pi-herdr (herdr_layout/pane/agent). */
 export { default as registerHerdrTool } from "./herdr/tool.js";
 export {
   clearResultFile,

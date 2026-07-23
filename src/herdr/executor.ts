@@ -30,18 +30,32 @@ export type HerdrAgentWaitProgress = {
   maxSubmissions?: number;
 };
 
+export type HerdrOriginFocus = {
+  workspaceId?: string;
+  tabId?: string;
+};
+
 export type HerdrStepExecutorOptions = {
   client?: HerdrClient;
   /**
-   * Existing workspace to host agent panes. When omitted, the first agent
-   * step creates one labeled with the run id and reuses it for the run.
+   * Existing workspace to host agent panes. When omitted, the first agent step
+   * prefers a tab in the orchestrator workspace (`originFocus.workspaceId` /
+   * `HERDR_WORKSPACE_ID`), and only creates a separate workspace as fallback.
    */
   workspaceId?: string;
   /** cwd for newly created workspaces / panes. */
   cwd?: string;
+  /**
+   * Orchestrator focus to restore after agent steps / dispose cleanup.
+   * Defaults to `HERDR_WORKSPACE_ID` / `HERDR_TAB_ID` when present.
+   */
+  originFocus?: HerdrOriginFocus;
   /** Build native arguments passed after `herdr agent start ... --`. */
   buildAgentArgs?: (ctx: AgentStartContext) => string[];
-  /** Close the run workspace when the executor is disposed. Default false. */
+  /**
+   * Tear down run-owned layout on dispose: close an owned tab, or an owned
+   * fallback workspace. Default false.
+   */
   closeWorkspaceOnDispose?: boolean;
   /** Max time for `agent prompt --wait`. Default 30m. Engine abort still wins. */
   completionTimeoutMs?: number;
@@ -73,11 +87,13 @@ export type AgentStartContext = {
  * Runs agent steps in Herdr panes.
  *
  * Layout:
- * - one workspace per workflow run (created on first agent step, or injected)
+ * - prefer one tab in the orchestrator workspace (avoids Herdr focus jumps
+ *   that happen when a whole workspace is closed)
+ * - fallback: one workspace per run when no origin workspace is known
  * - one pane per agent attempt, labeled with spawn.name
  * - environment prepared in the pane shell before Herdr starts interactive pi
  * Completion path:
- * 1. workspace/pane allocation
+ * 1. tab/workspace + pane allocation
  * 2. `herdr agent start ... --kind pi` validates interactive readiness
  * 3. `herdr agent prompt ... --wait` blocks on a lifecycle signal
  * 4. read authoritative result.json written by workflow_done
@@ -86,6 +102,7 @@ export type AgentStartContext = {
 export class HerdrStepExecutor implements AgentStepExecutor {
   private readonly client: HerdrClient;
   private readonly cwd?: string;
+  private readonly originFocus: HerdrOriginFocus;
   private readonly buildAgentArgs: (ctx: AgentStartContext) => string[];
   private readonly closeWorkspaceOnDispose: boolean;
   private readonly completionTimeoutMs: number;
@@ -93,7 +110,9 @@ export class HerdrStepExecutor implements AgentStepExecutor {
   private readonly onProgress?: (event: HerdrAgentWaitProgress) => void;
   private readonly childExtensionPath: string;
   private workspaceId: string | null;
+  private runTabId: string | null = null;
   private ownsWorkspace = false;
+  private ownsTab = false;
   private rootPaneId: string | null = null;
   private lastPaneId: string | null = null;
 
@@ -101,6 +120,7 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     this.client = options.client ?? new HerdrClient();
     this.cwd = options.cwd;
     this.workspaceId = options.workspaceId ?? null;
+    this.originFocus = resolveOriginFocus(options.originFocus);
     this.buildAgentArgs = options.buildAgentArgs ?? defaultAgentArgs;
     this.closeWorkspaceOnDispose = options.closeWorkspaceOnDispose ?? false;
     this.completionTimeoutMs = options.completionTimeoutMs ?? 30 * 60_000;
@@ -113,13 +133,62 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     return this.workspaceId;
   }
 
+  get runTabIdValue(): string | null {
+    return this.runTabId;
+  }
+
   async dispose(signal?: AbortSignal): Promise<void> {
-    if (this.closeWorkspaceOnDispose && this.ownsWorkspace && this.workspaceId) {
-      try {
-        await this.client.workspaceClose(this.workspaceId, signal);
-      } catch {
-        // Best effort.
+    if (!this.closeWorkspaceOnDispose) return;
+    const closingTabId = this.ownsTab ? this.runTabId : null;
+    const closingWorkspaceId = this.ownsWorkspace ? this.workspaceId : null;
+    if (!closingTabId && !closingWorkspaceId) return;
+    try {
+      // Always put the user back on the orchestrator before tearing layout down.
+      // Closing a non-focused *workspace* still reassigns Herdr's focused
+      // workspace to an arbitrary neighbor; tab close does not.
+      await this.restoreOriginFocus(signal);
+      if (closingTabId) {
+        await this.client.tabClose(closingTabId, signal);
+      } else if (closingWorkspaceId) {
+        await this.client.workspaceClose(closingWorkspaceId, signal);
+        // workspace.close can still flip the focused workspace flag even when
+        // we restored first; restore again so the UI settles on origin.
+        await this.restoreOriginFocus(signal);
       }
+    } catch {
+      // Best effort.
+    } finally {
+      this.workspaceId = null;
+      this.runTabId = null;
+      this.ownsWorkspace = false;
+      this.ownsTab = false;
+      this.rootPaneId = null;
+      this.lastPaneId = null;
+    }
+  }
+
+  /** Best-effort return to the pane/workspace that launched the workflow. */
+  private async restoreOriginFocus(signal?: AbortSignal): Promise<void> {
+    const originWorkspace = this.originFocus.workspaceId;
+    const originTab = this.originFocus.tabId;
+    if (!originWorkspace && !originTab) return;
+    // Never focus a fallback workspace we are about to destroy.
+    if (
+      this.ownsWorkspace &&
+      originWorkspace &&
+      originWorkspace === this.workspaceId
+    ) {
+      return;
+    }
+    try {
+      if (originWorkspace) {
+        await this.client.workspaceFocus(originWorkspace, signal);
+      }
+      if (originTab) {
+        await this.client.tabFocus(originTab, signal);
+      }
+    } catch {
+      // Cosmetic: dispose/close must still proceed.
     }
   }
 
@@ -246,6 +315,9 @@ export class HerdrStepExecutor implements AgentStepExecutor {
       );
     } finally {
       this.lastPaneId = paneId;
+      // agent.start can steal UI focus into the run workspace; put the user
+      // back on the orchestrator between steps and before dispose/close.
+      await this.restoreOriginFocus(signal);
     }
   }
 
@@ -343,24 +415,52 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     runId: string,
     signal: AbortSignal,
   ): Promise<void> {
-    if (this.workspaceId) {
-      if (!this.rootPaneId) {
-        const panes = await this.client.paneList(this.workspaceId, signal);
-        this.rootPaneId = panes[0]?.pane_id ?? null;
-        this.lastPaneId = this.rootPaneId;
-      }
+    if (this.workspaceId && this.rootPaneId) return;
+    if (this.workspaceId && !this.rootPaneId) {
+      // Injected workspace without a known root pane: pick any pane as split source.
+      const panes = await this.client.paneList(this.workspaceId, signal);
+      this.rootPaneId = panes[0]?.pane_id ?? null;
+      this.lastPaneId = this.rootPaneId;
       return;
     }
+
+    const label = `wf:${runId}`.slice(0, 48);
+    const cwd = spawn.cwd ?? this.cwd;
+    const hostWorkspace = this.originFocus.workspaceId;
+
+    // Prefer a tab inside the orchestrator workspace. Closing a tab does not
+    // reassign Herdr's focused workspace the way workspace.close does.
+    if (hostWorkspace) {
+      const tab = await this.client.tabCreate(
+        {
+          workspaceId: hostWorkspace,
+          cwd,
+          label,
+          focus: false,
+        },
+        signal,
+      );
+      this.workspaceId = tab.workspace_id ?? hostWorkspace;
+      this.runTabId = tab.tab_id;
+      this.ownsTab = true;
+      this.ownsWorkspace = false;
+      this.rootPaneId = tab.pane_id ?? null;
+      this.lastPaneId = this.rootPaneId;
+      return;
+    }
+
+    // No known orchestrator workspace (e.g. tests / non-Herdr host): fallback.
     const created = await this.client.workspaceCreate(
       {
-        cwd: spawn.cwd ?? this.cwd,
-        label: `wf:${runId}`.slice(0, 48),
+        cwd,
+        label,
         focus: false,
       },
       signal,
     );
     this.workspaceId = created.workspace_id;
     this.ownsWorkspace = true;
+    this.ownsTab = false;
     this.rootPaneId = created.pane_id ?? null;
     if (!this.rootPaneId) {
       const panes = await this.client.paneList(this.workspaceId, signal);
@@ -381,7 +481,11 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     // First agent can reuse the workspace root pane if it is still empty of
     // work; subsequent agents split from the last pane.
     let paneId: string;
-    if (this.lastPaneId === this.rootPaneId && this.ownsWorkspace && !this.hasUsedRoot) {
+    if (
+      this.lastPaneId === this.rootPaneId &&
+      (this.ownsWorkspace || this.ownsTab) &&
+      !this.hasUsedRoot
+    ) {
       paneId = sourcePane;
       this.hasUsedRoot = true;
     } else {
@@ -464,6 +568,23 @@ export class HerdrStepExecutor implements AgentStepExecutor {
       await sleep(1_000, signal);
     }
   }
+}
+
+function resolveOriginFocus(explicit?: HerdrOriginFocus): HerdrOriginFocus {
+  // Explicit object (even empty) wins so unit tests are not polluted by a live
+  // HERDR_* environment. Env is only the default when the caller omits the field.
+  if (explicit) {
+    return {
+      ...(explicit.workspaceId ? { workspaceId: explicit.workspaceId } : {}),
+      ...(explicit.tabId ? { tabId: explicit.tabId } : {}),
+    };
+  }
+  const workspaceId = process.env.HERDR_WORKSPACE_ID;
+  const tabId = process.env.HERDR_TAB_ID;
+  return {
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(tabId ? { tabId } : {}),
+  };
 }
 
 function buildValidationRetryPrompt(
