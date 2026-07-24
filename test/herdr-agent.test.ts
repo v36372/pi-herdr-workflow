@@ -597,6 +597,147 @@ test("dispose closes a run tab in the origin workspace without workspace.close",
   }
 });
 
+test("spawn.kind pi-wiz still starts Herdr kind pi and sources wiz env", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-pi-wiz-"));
+  const artifactDir = path.join(root, "agents", "wiz", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const calls: string[][] = [];
+  const progress: string[] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w1" },
+          root_pane: { pane_id: "w1:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-1",
+          nodeId: "wiz",
+          attemptId: "12345678-abcd",
+          output: { ok: true },
+        });
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+    onProgress: (event) => progress.push(event.message),
+  });
+
+  try {
+    await executor.runAgentStep(
+      {
+        contract: {
+          ...baseContract(artifactDir, resultPath),
+          nodeId: "wiz",
+        },
+        prompt: "check wiz",
+        spawn: {
+          name: "Morning: Wiz",
+          kind: "pi-wiz",
+          tools: "mcp,read",
+          fork: false,
+        },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+
+    const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
+    assert.ok(start);
+    assert.equal(start![start!.indexOf("--kind") + 1], "pi");
+    assert.ok(
+      progress.some((message) => message.includes("--kind pi") && message.includes("workflow kind pi-wiz")),
+    );
+
+    const envPath = path.join(artifactDir, "agent-env.sh");
+    assert.equal(existsSync(envPath), true);
+    const envScript = readFileSync(envPath, "utf8");
+    assert.match(envScript, /spawn\.kind=pi-wiz/);
+    assert.match(envScript, /\.config\/wiz-mcp\/env\.zsh/);
+
+    // pi-wiz must load pi-mcp-adapter so the mcp tool exists for Wiz.
+    // `pi -e` accepts package sources (https:// / git: / npm:), not only paths.
+    const dashE = start!.reduce<number[]>((idxs, arg, i) => {
+      if (arg === "-e") idxs.push(i);
+      return idxs;
+    }, []);
+    assert.ok(dashE.length >= 2, `expected >=2 -e args, got ${JSON.stringify(start)}`);
+    const extensionSources = dashE.map((i) => start![i + 1]!);
+    assert.ok(
+      extensionSources.includes("https://github.com/nicobailon/pi-mcp-adapter"),
+      `expected pi-mcp-adapter package source in ${JSON.stringify(extensionSources)}`,
+    );
+    // Default: leave pane open for collaboration.
+    assert.equal(calls.some((args) => args[0] === "pane" && args[1] === "close"), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("spawn.closePaneAfterDone closes the pane after workflow_done", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-close-pane-"));
+  const artifactDir = path.join(root, "agents", "worker", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const calls: string[][] = [];
+  const client = new HerdrClient({
+    exec: async (args) => {
+      calls.push(args);
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w1" },
+          root_pane: { pane_id: "w1:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        writeFakeAgentResult({
+          resultPath,
+          runId: "run-1",
+          nodeId: "worker",
+          attemptId: "12345678-abcd",
+          output: { ok: true },
+        });
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+  });
+
+  try {
+    await executor.runAgentStep(
+      {
+        contract: baseContract(artifactDir, resultPath),
+        prompt: "do work",
+        spawn: {
+          name: "worker",
+          tools: "read",
+          fork: false,
+          closePaneAfterDone: true,
+        },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+    assert.ok(
+      calls.some((args) => args[0] === "pane" && args[1] === "close"),
+      `expected pane close in ${JSON.stringify(calls)}`,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("dispose restores origin focus before and after fallback workspace.close", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "phw-dispose-ws-"));
   const artifactDir = path.join(root, "agents", "review", "12345678-abcd");

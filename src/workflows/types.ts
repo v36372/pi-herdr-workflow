@@ -64,6 +64,16 @@ export type AgentSpawnParams = {
   tools?: string;
   /** Working directory for the agent process. */
   cwd?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
+  /**
+   * Workflow launch kind. Defaults to `pi`.
+   *
+   * - `pi` — standard pi child (Herdr `--kind pi`)
+   * - `pi-wiz` — pi + local Wiz MCP env bootstrap (`~/.config/wiz-mcp/env.zsh`)
+   *   and `pi -e https://github.com/nicobailon/pi-mcp-adapter` (MCP is not
+   *   built into pi; `-e` accepts package sources, not only file paths).
+   *   Still starts as Herdr kind `pi`; env is injected via `agent-env.sh`.
+   */
+  kind?: WorkflowAgentKind;
   /** Force full-context fork of the orchestrator session into the child. */
   fork?: boolean;
   /**
@@ -71,7 +81,15 @@ export type AgentSpawnParams = {
    * long waits as stalls. Defaults depend on executor/agent frontmatter.
    */
   interactive?: boolean;
+  /**
+   * When true, close the agent pane after a successful `workflow_done`.
+   * Default false so collaborative agents can keep working in the open pane.
+   */
+  closePaneAfterDone?: boolean;
 };
+
+/** Workflow-level agent launch kinds (not the full Herdr kind enum). */
+export type WorkflowAgentKind = "pi" | "pi-wiz";
 
 /** Spawn params after context callbacks have been resolved. */
 export type ResolvedAgentSpawn = {
@@ -82,7 +100,10 @@ export type ResolvedAgentSpawn = {
   skills?: string;
   tools?: string;
   cwd?: string;
+  kind?: WorkflowAgentKind;
   fork: boolean;
+  /** Close the Herdr pane after successful workflow_done. Default false. */
+  closePaneAfterDone?: boolean;
   interactive?: boolean;
 };
 

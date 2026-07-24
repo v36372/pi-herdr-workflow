@@ -18,16 +18,43 @@ export type WorkflowProgressSnapshot = {
   message: string;
   nodes: WorkflowNodeProgress[];
   currentNodeId?: string;
+  /** Runtime node kind for the current step (agent/action/compute/…). */
+  currentNodeType?: string;
+  /** Human one-liner for whatever the engine is doing right now (any node kind). */
+  activity?: string;
   agentName?: string;
   paneId?: string;
   status?: WorkflowRunState["status"];
   runDir?: string;
+  /**
+   * Spinner frame index for the live running mark. The sticky widget advances
+   * this; plain text / tool partials may leave it unset (static first frame).
+   */
+  spinnerFrame?: number;
 };
 
 type ThemeLike = {
   fg: (name: ThemeColor, text: string) => string;
   bold: (text: string) => string;
+  strikethrough?: (text: string) => string;
 };
+
+/**
+ * Pi default working-indicator frames (`@earendil-works/pi-tui` Loader /
+ * WorkingStatusIndicator). Used for in-progress agent steps.
+ */
+export const PI_DEFAULT_SPINNER_FRAMES = [
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+] as const;
 
 /** BFS from startAt so sibling branches appear as a group after their parent. */
 export function orderWorkflowNodes(workflow: WorkflowDefinition): string[] {
@@ -112,18 +139,29 @@ function nodeSummary(node: WorkflowDefinition["nodes"][string]): string | undefi
   return undefined;
 }
 
-/** ✓ done · ◉ running · ○ pending/skipped · ✗ failed */
-export function statusMark(status: WorkflowNodeUiStatus): string {
+/**
+ * Icons (pi-tasks / Claude Code style for terminal states; Pi default braille
+ * spinner for the live running mark):
+ *   ✔ done · ⠋… running · ◻ pending/skipped · ✗ failed
+ */
+export function statusMark(
+  status: WorkflowNodeUiStatus,
+  spinnerFrame = 0,
+): string {
   switch (status) {
     case "done":
-      return "✓";
+      return "✔";
     case "running":
-      return "◉";
+      return PI_DEFAULT_SPINNER_FRAMES[
+        ((spinnerFrame % PI_DEFAULT_SPINNER_FRAMES.length) +
+          PI_DEFAULT_SPINNER_FRAMES.length) %
+          PI_DEFAULT_SPINNER_FRAMES.length
+      ]!;
     case "failed":
       return "✗";
     case "skipped":
     case "pending":
-      return "○";
+      return "◻";
     default: {
       const _exhaustive: never = status;
       return _exhaustive;
@@ -132,30 +170,167 @@ export function statusMark(status: WorkflowNodeUiStatus): string {
 }
 
 export function formatElapsed(elapsedMs: number): string {
-  return `${Math.floor(elapsedMs / 1_000)}s`;
+  const totalSec = Math.floor(elapsedMs / 1_000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min < 60) return sec > 0 ? `${min}m ${sec}s` : `${min}m`;
+  const hr = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin > 0 ? `${hr}h ${remMin}m` : `${hr}h`;
 }
 
-/** Plain-text node list for tool content / widget string arrays. */
+/** Resolve the live activity one-liner (shell/compute/agent). */
+export function resolveActivity(snapshot: WorkflowProgressSnapshot): string | undefined {
+  const candidates = [snapshot.activity, snapshot.message];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim() && !isHerdrNoise(candidate)) {
+      return candidate.trim();
+    }
+  }
+  const running = snapshot.nodes.find((node) => node.status === "running");
+  if (running?.summary) return running.summary;
+  return undefined;
+}
+
+function countByStatus(nodes: WorkflowNodeProgress[]): {
+  done: number;
+  running: number;
+  open: number;
+  failed: number;
+} {
+  let done = 0;
+  let running = 0;
+  let open = 0;
+  let failed = 0;
+  for (const node of nodes) {
+    if (node.status === "done") done += 1;
+    else if (node.status === "running") running += 1;
+    else if (node.status === "failed") failed += 1;
+    else open += 1; // pending + skipped
+  }
+  return { done, running, open, failed };
+}
+
+/** pi-tasks-style header: "● N steps (1 done, 1 in progress, 2 open)" */
+export function formatStepsHeader(snapshot: WorkflowProgressSnapshot): string {
+  const { done, running, open, failed } = countByStatus(snapshot.nodes);
+  const parts: string[] = [];
+  if (done > 0) parts.push(`${done} done`);
+  if (running > 0) parts.push(`${running} in progress`);
+  if (failed > 0) parts.push(`${failed} failed`);
+  if (open > 0) parts.push(`${open} open`);
+  const counts =
+    snapshot.nodes.length === 0
+      ? "0 steps"
+      : parts.length > 0
+        ? `${snapshot.nodes.length} steps (${parts.join(", ")})`
+        : `${snapshot.nodes.length} steps`;
+  return `● ${snapshot.workflowName} · ${counts} · ${formatElapsed(snapshot.elapsedMs)}`;
+}
+
+/**
+ * Compact live status for the in-chat tool partial.
+ * Intentionally NOT the agent checklist — that lives in the sticky widget only.
+ */
+export function formatActivityText(snapshot: WorkflowProgressSnapshot): string {
+  const parts = [
+    snapshot.workflowName,
+    snapshot.status ?? snapshot.phase,
+    formatElapsed(snapshot.elapsedMs),
+  ];
+  if (snapshot.currentNodeId) {
+    const kind =
+      snapshot.currentNodeType && snapshot.currentNodeType !== "agent"
+        ? `${snapshot.currentNodeId} (${snapshot.currentNodeType})`
+        : snapshot.currentNodeId;
+    parts.push(kind);
+  }
+  const activity = resolveActivity(snapshot);
+  if (activity) parts.push(activity);
+  if (snapshot.agentName) parts.push(snapshot.agentName);
+  return parts.join(" · ");
+}
+
+/** Label for a step line: subject (summary) preferred, else node id. */
+function stepLabel(node: WorkflowNodeProgress): string {
+  return node.summary?.trim() || node.id;
+}
+
+/** Active form like pi-tasks: continuous-ish summary with ellipsis. */
+function activeForm(node: WorkflowNodeProgress): string {
+  const base = stepLabel(node);
+  return base.endsWith("…") || base.endsWith("...") ? base : `${base}…`;
+}
+
+/** Plain-text strikethrough via combining long stroke overlay (no theme needed). */
+export function plainStrikethrough(text: string): string {
+  return Array.from(text)
+    .map((ch) => `${ch}\u0336`)
+    .join("");
+}
+
+/**
+ * Agent checklist for the sticky editor widget (and final settled tool result).
+ * Visual language from @tintinweb/pi-tasks + Pi default braille spinner:
+ *   ● N steps (counts)
+ *     ✔ #1 done subject   (strikethrough)
+ *     ⠋ #2 active form…
+ *     ◻ #3 pending subject
+ */
 export function formatProgressText(snapshot: WorkflowProgressSnapshot): string {
-  const header = `${snapshot.workflowName} · ${snapshot.status ?? snapshot.phase} · ${formatElapsed(snapshot.elapsedMs)}`;
-  const lines = snapshot.nodes.map((node) => {
-    const mark = statusMark(node.status);
-    // Prefer the author one-liner; only show orchestrator message when blocked/etc.
-    const detail =
-      node.status === "running"
-        ? node.summary ??
-          (snapshot.message && !isHerdrNoise(snapshot.message) ? snapshot.message : undefined)
-        : node.summary;
-    return detail ? `${mark} ${node.id}  ${detail}` : `${mark} ${node.id}`;
+  const spinnerFrame = snapshot.spinnerFrame ?? 0;
+  const lines = [formatStepsHeader(snapshot)];
+
+  // Non-agent work is invisible in the step list — surface it under the header.
+  const onAgent =
+    snapshot.currentNodeType === "agent" ||
+    snapshot.nodes.some((node) => node.status === "running" && node.id === snapshot.currentNodeId);
+  const activity = resolveActivity(snapshot);
+  if (activity && !onAgent && snapshot.currentNodeId) {
+    const kind =
+      snapshot.currentNodeType && snapshot.currentNodeType !== "agent"
+        ? `${snapshot.currentNodeId} (${snapshot.currentNodeType})`
+        : snapshot.currentNodeId;
+    lines.push(`  now  ${kind} · ${activity}`);
+  }
+
+  snapshot.nodes.forEach((node, index) => {
+    const n = index + 1;
+    const mark = statusMark(node.status, spinnerFrame);
+    if (node.status === "running") {
+      lines.push(`  ${mark} #${n} ${activeForm(node)}`);
+    } else if (node.status === "done") {
+      lines.push(`  ${mark} ${plainStrikethrough(`#${n} ${stepLabel(node)}`)}`);
+    } else {
+      lines.push(`  ${mark} #${n} ${stepLabel(node)}`);
+    }
   });
-  return [header, ...lines].join("\n");
+
+  return lines.join("\n");
 }
 
 function isHerdrNoise(message: string): boolean {
   return /\bherdr\b/i.test(message) || /\bagent (start|prompt|wait)\b/i.test(message);
 }
 
-/** Themed TUI block for renderResult. */
+/** Compact themed line for partial tool results (no agent checklist). */
+export function formatActivityThemed(snapshot: WorkflowProgressSnapshot, theme: ThemeLike): string {
+  const phaseColor =
+    snapshot.phase === "completed"
+      ? "success"
+      : snapshot.phase === "failed"
+        ? "error"
+        : snapshot.phase === "waiting"
+          ? "warning"
+          : "accent";
+  const text = formatActivityText(snapshot);
+  const sep = text.indexOf(" · ");
+  if (sep === -1) return theme.fg(phaseColor, theme.bold(text));
+  return theme.fg(phaseColor, theme.bold(text.slice(0, sep))) + theme.fg("dim", text.slice(sep));
+}
+
+/** Themed agent checklist — pi-tasks colors + completed strikethrough. */
 export function formatProgressThemed(snapshot: WorkflowProgressSnapshot, theme: ThemeLike): string {
   const phaseColor =
     snapshot.phase === "completed"
@@ -165,34 +340,61 @@ export function formatProgressThemed(snapshot: WorkflowProgressSnapshot, theme: 
         : snapshot.phase === "waiting"
           ? "warning"
           : "accent";
-  const header =
-    theme.fg(phaseColor, theme.bold(snapshot.workflowName)) +
-    theme.fg("dim", ` · ${snapshot.status ?? snapshot.phase} · ${formatElapsed(snapshot.elapsedMs)}`);
 
-  const lines = snapshot.nodes.map((node) => {
-    const mark = themeStatusMark(node.status, theme);
-    const name =
-      node.status === "running"
-        ? theme.fg("accent", node.id)
-        : node.status === "done"
-          ? theme.fg("muted", node.id)
-          : node.status === "failed"
-            ? theme.fg("error", node.id)
-            : theme.fg("dim", node.id);
-    const detailText =
-      node.status === "running"
-        ? node.summary ??
-          (snapshot.message && !isHerdrNoise(snapshot.message) ? snapshot.message : undefined)
-        : node.summary;
-    const extra = detailText ? theme.fg("dim", `  ${detailText}`) : "";
-    return `${mark} ${name}${extra}`;
+  const spinnerFrame = snapshot.spinnerFrame ?? 0;
+  const headerPlain = formatStepsHeader(snapshot);
+  // Color the bullet + workflow name segment; rest dim.
+  const afterBullet = headerPlain.startsWith("● ") ? headerPlain.slice(2) : headerPlain;
+  const nameSep = afterBullet.indexOf(" · ");
+  const header =
+    theme.fg(phaseColor, "●") +
+    " " +
+    (nameSep === -1
+      ? theme.fg(phaseColor, theme.bold(afterBullet))
+      : theme.fg(phaseColor, theme.bold(afterBullet.slice(0, nameSep))) +
+        theme.fg("dim", afterBullet.slice(nameSep)));
+
+  const lines = [header];
+
+  const onAgent =
+    snapshot.currentNodeType === "agent" ||
+    snapshot.nodes.some((node) => node.status === "running" && node.id === snapshot.currentNodeId);
+  const activity = resolveActivity(snapshot);
+  if (activity && !onAgent && snapshot.currentNodeId) {
+    const kind =
+      snapshot.currentNodeType && snapshot.currentNodeType !== "agent"
+        ? `${snapshot.currentNodeId} (${snapshot.currentNodeType})`
+        : snapshot.currentNodeId;
+    lines.push(theme.fg("dim", `  now  ${kind} · ${activity}`));
+  }
+
+  snapshot.nodes.forEach((node, index) => {
+    const n = index + 1;
+    const mark = themeStatusMark(node.status, theme, spinnerFrame);
+    const idLabel = `#${n}`;
+    if (node.status === "running") {
+      const form = activeForm(node);
+      lines.push(`  ${mark} ${theme.fg("dim", idLabel)} ${theme.fg("accent", form)}`);
+    } else if (node.status === "done") {
+      const body = `${idLabel} ${stepLabel(node)}`;
+      const struck = theme.strikethrough ? theme.strikethrough(body) : plainStrikethrough(body);
+      lines.push(`  ${mark} ${theme.fg("dim", struck)}`);
+    } else if (node.status === "failed") {
+      lines.push(`  ${mark} ${theme.fg("dim", idLabel)} ${theme.fg("error", stepLabel(node))}`);
+    } else {
+      lines.push(`  ${mark} ${theme.fg("dim", idLabel)} ${stepLabel(node)}`);
+    }
   });
 
-  return [header, ...lines].join("\n");
+  return lines.join("\n");
 }
 
-function themeStatusMark(status: WorkflowNodeUiStatus, theme: ThemeLike): string {
-  const mark = statusMark(status);
+function themeStatusMark(
+  status: WorkflowNodeUiStatus,
+  theme: ThemeLike,
+  spinnerFrame = 0,
+): string {
+  const mark = statusMark(status, spinnerFrame);
   switch (status) {
     case "done":
       return theme.fg("success", mark);

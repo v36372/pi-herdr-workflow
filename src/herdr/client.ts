@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { Effect, Schema } from "effect";
 
 export type HerdrJsonEnvelope = {
   result?: unknown;
@@ -20,33 +21,44 @@ export type HerdrClientOptions = {
 };
 
 /** Machine-readable Herdr CLI/server failure with preserved error code. */
-export class HerdrError extends Error {
-  readonly code: string;
-  readonly args: string[];
-  readonly exitCode: number | null;
-  readonly id?: string;
-
-  constructor(
-    code: string,
-    message: string,
-    options: { args?: string[]; exitCode?: number | null; id?: string; cause?: unknown } = {},
-  ) {
-    super(message, options.cause !== undefined ? { cause: options.cause } : undefined);
-    this.name = "HerdrError";
-    this.code = code;
-    this.args = options.args ?? [];
-    this.exitCode = options.exitCode ?? null;
-    if (options.id !== undefined) this.id = options.id;
-  }
-}
+export class HerdrError extends Schema.TaggedErrorClass<HerdrError>()("HerdrError", {
+  code: Schema.String,
+  message: Schema.String,
+  args: Schema.Array(Schema.String),
+  exitCode: Schema.NullOr(Schema.Number),
+  id: Schema.optionalKey(Schema.String),
+}) {}
 
 export function isHerdrError(error: unknown): error is HerdrError {
-  return error instanceof HerdrError;
+  return (
+    error instanceof HerdrError ||
+    (typeof error === "object" &&
+      error !== null &&
+      "_tag" in error &&
+      (error as { _tag: unknown })._tag === "HerdrError")
+  );
+}
+
+export function makeHerdrError(
+  code: string,
+  message: string,
+  options: { args?: readonly string[]; exitCode?: number | null; id?: string } = {},
+): HerdrError {
+  return new HerdrError({
+    code,
+    message,
+    args: [...(options.args ?? [])],
+    exitCode: options.exitCode ?? null,
+    ...(options.id !== undefined ? { id: options.id } : {}),
+  });
 }
 
 /**
  * Thin typed wrapper over the herdr CLI. Uses `--json`-friendly subcommands
  * that print a `{ result | error }` envelope on stdout.
+ *
+ * Methods are Promise-facing for the current executor/tests. Internals lift
+ * process I/O through Effect so callers can later consume the Effect surface.
  */
 export class HerdrClient {
   private readonly binary: string;
@@ -57,47 +69,74 @@ export class HerdrClient {
     this.execImpl = options.exec ?? ((args, signal) => execProcess(this.binary, args, signal));
   }
 
+  /** Effect form of {@link exec}. */
+  execEffect(args: string[], signal?: AbortSignal): Effect.Effect<HerdrExecResult, HerdrError> {
+    return Effect.tryPromise({
+      try: async () => {
+        const result = await this.execImpl(args, signal);
+        if (signal?.aborted) {
+          throw abortError(signal);
+        }
+        const envelope = findHerdrErrorEnvelope(result);
+        if (envelope) {
+          throw herdrEnvelopeError(args, envelope, result.code);
+        }
+        if (result.code !== 0) {
+          throw herdrFailure(args, result);
+        }
+        return result;
+      },
+      catch: (cause) => {
+        if (isHerdrError(cause)) return cause;
+        if (cause instanceof Error) {
+          return makeHerdrError("command_failed", cause.message, { args });
+        }
+        return makeHerdrError("command_failed", String(cause), { args });
+      },
+    });
+  }
+
   async exec(args: string[], signal?: AbortSignal): Promise<HerdrExecResult> {
-    const result = await this.execImpl(args, signal);
-    if (signal?.aborted) {
-      throw abortError(signal);
-    }
-    // Herdr may emit a JSON error envelope with exit 0. Detect only parseable
-    // `{ error: ... }` envelopes so ordinary text output (agent read) is kept.
-    const envelope = findHerdrErrorEnvelope(result);
-    if (envelope) {
-      throw herdrEnvelopeError(args, envelope, result.code);
-    }
-    if (result.code !== 0) {
-      throw herdrFailure(args, result);
-    }
-    return result;
+    return Effect.runPromise(this.execEffect(args, signal));
+  }
+
+  /** Effect form of {@link json}. */
+  jsonEffect<T = unknown>(args: string[], signal?: AbortSignal): Effect.Effect<T, HerdrError> {
+    return this.execEffect(args, signal).pipe(
+      Effect.flatMap((result) => {
+        const stdout = result.stdout.trim();
+        if (!stdout) {
+          return Effect.fail(
+            makeHerdrError("invalid_response", `Expected JSON from herdr ${args.join(" ")}`, {
+              args,
+              exitCode: result.code,
+            }),
+          );
+        }
+        let value: HerdrJsonEnvelope;
+        try {
+          value = JSON.parse(stdout) as HerdrJsonEnvelope;
+        } catch (cause) {
+          return Effect.fail(
+            makeHerdrError(
+              "invalid_response",
+              `Failed to parse JSON from herdr ${args.join(" ")}: ${
+                cause instanceof Error ? cause.message : String(cause)
+              }`,
+              { args, exitCode: result.code },
+            ),
+          );
+        }
+        if (value.error) {
+          return Effect.fail(herdrEnvelopeError(args, value, result.code));
+        }
+        return Effect.succeed(value as T);
+      }),
+    );
   }
 
   async json<T = unknown>(args: string[], signal?: AbortSignal): Promise<T> {
-    const result = await this.exec(args, signal);
-    const stdout = result.stdout.trim();
-    if (!stdout) {
-      throw new HerdrError(
-        "invalid_response",
-        `Expected JSON from herdr ${args.join(" ")}`,
-        { args, exitCode: result.code },
-      );
-    }
-    let value: HerdrJsonEnvelope;
-    try {
-      value = JSON.parse(stdout) as HerdrJsonEnvelope;
-    } catch (cause) {
-      throw new HerdrError(
-        "invalid_response",
-        `Failed to parse JSON from herdr ${args.join(" ")}`,
-        { args, exitCode: result.code, cause },
-      );
-    }
-    if (value.error) {
-      throw herdrEnvelopeError(args, value, result.code);
-    }
-    return value as T;
+    return Effect.runPromise(this.jsonEffect<T>(args, signal));
   }
 
   async workspaceCreate(
@@ -357,12 +396,12 @@ function herdrFailure(args: string[], result: HerdrExecResult): HerdrError {
   for (const raw of [result.stderr, result.stdout]) {
     const trimmed = raw.trim();
     if (!trimmed) continue;
-    return new HerdrError("command_failed", trimmed, {
+    return makeHerdrError("command_failed", trimmed, {
       args,
       exitCode: result.code,
     });
   }
-  return new HerdrError(
+  return makeHerdrError(
     "command_failed",
     `herdr ${args.join(" ")} failed (${result.code})`,
     { args, exitCode: result.code },
@@ -379,7 +418,7 @@ function herdrEnvelopeError(
     value.error?.message?.trim() ||
     value.error?.code?.trim() ||
     `herdr ${args.join(" ")} failed`;
-  return new HerdrError(code, message, {
+  return makeHerdrError(code, message, {
     args,
     exitCode,
     ...(value.id ? { id: value.id } : {}),

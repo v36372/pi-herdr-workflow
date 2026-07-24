@@ -1,13 +1,16 @@
 import { mkdirSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { Effect } from "effect";
 import type {
   AgentStepExecutor,
   AgentStepRequest,
   AgentStepSubmission,
   ResolvedAgentSpawn,
+  WorkflowAgentKind,
 } from "../workflows/types.js";
 import { preloadSkills, resolveAgentLaunch } from "./agent-defaults.js";
-import { HerdrClient, HerdrError, isHerdrError } from "./client.js";
+import { HerdrClient, isHerdrError, makeHerdrError } from "./client.js";
 import {
   clearResultFile,
   ensureArtifactDir,
@@ -95,6 +98,8 @@ export type AgentStartContext = {
  * Completion path:
  * 1. tab/workspace + pane allocation
  * 2. `herdr agent start ... --kind pi` validates interactive readiness
+ *    (`spawn.kind: "pi-wiz"` still uses Herdr kind `pi`, after sourcing Wiz env
+ *    and loading `pi-mcp-adapter` so the `mcp` tool exists)
  * 3. `herdr agent prompt ... --wait` blocks on a lifecycle signal
  * 4. read authoritative result.json written by workflow_done
  * 5. on validation rejection, clear result.json and re-prompt the same agent
@@ -192,6 +197,17 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     }
   }
 
+  /** Effect form of {@link runAgentStep}. */
+  runAgentStepEffect(
+    request: AgentStepRequest,
+    signal: AbortSignal,
+  ): Effect.Effect<AgentStepSubmission, Error> {
+    return Effect.tryPromise({
+      try: () => this.runAgentStep(request, signal),
+      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+    });
+  }
+
   async runAgentStep(request: AgentStepRequest, signal: AbortSignal): Promise<AgentStepSubmission> {
     const { contract } = request;
     ensureArtifactDir(contract.artifactDir);
@@ -228,19 +244,22 @@ export class HerdrStepExecutor implements AgentStepExecutor {
 
     try {
       await this.prepareAgentEnvironment(paneId, startContext, signal);
+      const herdrKind = resolveHerdrKind(spawn.kind);
+      const kindNote =
+        spawn.kind && spawn.kind !== herdrKind ? ` (workflow kind ${spawn.kind})` : "";
       this.onProgress?.({
         phase: "agent_start",
         paneId,
         agentName,
         nodeId: contract.nodeId,
         spawnName: spawn.name,
-        message: `herdr agent start ${agentName} --kind pi --pane ${paneId}`,
+        message: `herdr agent start ${agentName} --kind ${herdrKind} --pane ${paneId}${kindNote}`,
       });
       try {
         await this.client.agentStart(
           {
             name: agentName,
-            kind: "pi",
+            kind: herdrKind,
             paneId,
             args: this.buildAgentArgs(startContext),
           },
@@ -300,6 +319,15 @@ export class HerdrStepExecutor implements AgentStepExecutor {
             submission,
             maxSubmissions: this.maxValidationAttempts,
           });
+          // Opt-in: close the agent pane after a successful submission so
+          // collaborative workflows can leave panes open by default.
+          if (spawn.closePaneAfterDone) {
+            try {
+              await this.client.paneClose(paneId, signal);
+            } catch {
+              // Best-effort; run layout cleanup still happens on dispose.
+            }
+          }
           return { output: accepted.value };
         }
 
@@ -388,22 +416,22 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     }
     switch (error.code) {
       case "protocol_mismatch":
-        return new HerdrError(
+        return makeHerdrError(
           error.code,
           `Herdr protocol mismatch while ${operation}ing agent ${agentName}. Upgrade Herdr/pi-herdr-workflows so CLI and server agree. ${error.message}`,
-          { args: error.args, exitCode: error.exitCode, id: error.id, cause: error },
+          { args: error.args, exitCode: error.exitCode, id: error.id },
         );
       case "agent_prompt_stalled":
-        return new HerdrError(
+        return makeHerdrError(
           error.code,
           `Agent ${agentName} did not begin working after prompt submission (agent_prompt_stalled). The pane may be blocked on a prompt, offline, or not accepting input. ${error.message}`,
-          { args: error.args, exitCode: error.exitCode, id: error.id, cause: error },
+          { args: error.args, exitCode: error.exitCode, id: error.id },
         );
       case "agent_not_running":
-        return new HerdrError(
+        return makeHerdrError(
           error.code,
           `Agent ${agentName} is no longer running in its pane (agent_not_running) during ${operation}. ${error.message}`,
-          { args: error.args, exitCode: error.exitCode, id: error.id, cause: error },
+          { args: error.args, exitCode: error.exitCode, id: error.id },
         );
       default:
         return error;
@@ -528,13 +556,11 @@ export class HerdrStepExecutor implements AgentStepExecutor {
       PI_WORKFLOW_TASK_PATH: ctx.taskPath,
       PI_WORKFLOW_ARTIFACT_DIR: ctx.artifactDir,
     };
-    writeFileSync(
-      setupPath,
-      `${Object.entries(env)
-        .map(([key, value]) => `export ${key}=${shellQuote(value)}`)
-        .join("\n")}\n`,
-      { encoding: "utf8", mode: 0o600 },
-    );
+    const lines = [
+      ...Object.entries(env).map(([key, value]) => `export ${key}=${shellQuote(value)}`),
+      ...buildKindBootstrapLines(ctx.spawn.kind),
+    ];
+    writeFileSync(setupPath, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
     await this.client.paneRun(
       paneId,
       `source ${shellQuote(setupPath)} && printf '%s\\n' ${shellQuote(marker)}`,
@@ -604,8 +630,48 @@ function buildValidationRetryPrompt(
   ].join("\n");
 }
 
+/**
+ * Map workflow spawn.kind → Herdr `--kind`.
+ * Herdr only accepts a fixed agent enum; `pi-wiz` is a pi wrapper with env bootstrap.
+ */
+export function resolveHerdrKind(kind: WorkflowAgentKind | undefined): "pi" {
+  if (kind === undefined || kind === "pi" || kind === "pi-wiz") {
+    return "pi";
+  }
+  // Exhaustiveness guard if WorkflowAgentKind grows without executor support.
+  const _exhaustive: never = kind;
+  throw new Error(`Unsupported workflow agent kind: ${String(_exhaustive)}`);
+}
+
+/** Shell lines sourced before agent start for kind-specific env bootstrap. */
+export function buildKindBootstrapLines(kind: WorkflowAgentKind | undefined): string[] {
+  if (kind !== "pi-wiz") {
+    return [];
+  }
+  // Mirrors zsh alias: pi-wiz='source "$HOME/.config/wiz-mcp/env.zsh" && pi'
+  const wizEnv = path.join(os.homedir(), ".config", "wiz-mcp", "env.zsh");
+  return [
+    "# workflow spawn.kind=pi-wiz → load Wiz MCP credentials (same as shell alias pi-wiz)",
+    `if [ -f ${shellQuote(wizEnv)} ]; then`,
+    "  set -a",
+    `  . ${shellQuote(wizEnv)}`,
+    "  set +a",
+    "fi",
+  ];
+}
+
+/** Package source accepted by `pi -e` (resolved via package-manager, incl. git URLs). */
+const PI_MCP_ADAPTER_SOURCE = "https://github.com/nicobailon/pi-mcp-adapter";
+
 function defaultAgentArgs(ctx: AgentStartContext): string[] {
+  // -ne disables settings discovery; explicit -e still loads (local path OR
+  // package source: npm:/git:/https://github.com/...). Package sources are
+  // resolved by PackageManager.resolveExtensionSources({ temporary: true }).
   const args = ["--no-session", "-ne", "-e", ctx.childExtensionPath];
+  if (ctx.spawn.kind === "pi-wiz") {
+    // Wiz MCP needs the mcp tool from pi-mcp-adapter.
+    args.push("-e", PI_MCP_ADAPTER_SOURCE);
+  }
   if (ctx.spawn.model) args.push("--model", ctx.spawn.model);
   if (ctx.thinking) args.push("--thinking", ctx.thinking);
   if (ctx.replaceSystemPrompt) {

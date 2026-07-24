@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Context, Effect, FileSystem, Layer } from "effect";
+import type { PlatformError } from "effect/PlatformError";
+import { NodeFileSystem } from "@effect/platform-node";
 import type {
   WorkflowDefinition,
   WorkflowDefinitionSnapshot,
@@ -44,91 +46,6 @@ export function createRunId(workflowName: string, now: Date = new Date()): strin
   return `${stamp}-${slug || "workflow"}-${randomUUID().slice(0, 8)}`;
 }
 
-/**
- * Persists run bundles. A bundle directory contains `manifest.json`,
- * `workflow.json` (definition snapshot), `state.json` (full run projection,
- * atomically replaced), and `trace.ndjson` (append-only event log).
- */
-export class WorkflowRunStore {
-  readonly outputRoot: string;
-  private readonly traceSeqByRun = new Map<string, number>();
-  private readonly appendChainByPath = new Map<string, Promise<void>>();
-
-  constructor(outputRoot: string = workflowRunsBaseDir()) {
-    this.outputRoot = outputRoot;
-  }
-
-  runDirFor(runId: string): string {
-    return path.join(this.outputRoot, runId);
-  }
-
-  async initializeRunBundle(
-    workflow: WorkflowDefinition,
-    state: WorkflowRunState,
-  ): Promise<string> {
-    const runDir = this.runDirFor(state.runId);
-    await fs.mkdir(runDir, { recursive: true });
-    this.traceSeqByRun.set(runDir, 0);
-
-    await writeJsonAtomic(
-      path.join(runDir, WORKFLOW_SNAPSHOT_PATH),
-      createDefinitionSnapshot(workflow),
-    );
-    await writeJsonAtomic(path.join(runDir, MANIFEST_PATH), createManifest(state));
-    await writeJsonAtomic(path.join(runDir, STATE_PATH), state);
-    await this.appendJsonLine(path.join(runDir, TRACE_PATH), null);
-
-    return runDir;
-  }
-
-  async writeSnapshot(
-    runDir: string,
-    state: WorkflowRunState,
-    event: WorkflowTraceEventDraft,
-  ): Promise<WorkflowTraceEvent> {
-    state.updatedAt = new Date().toISOString();
-    await writeJsonAtomic(path.join(runDir, STATE_PATH), state);
-    await writeJsonAtomic(path.join(runDir, MANIFEST_PATH), createManifest(state));
-    return await this.appendTrace(runDir, state, event);
-  }
-
-  async appendTrace(
-    runDir: string,
-    state: WorkflowRunState,
-    event: WorkflowTraceEventDraft,
-  ): Promise<WorkflowTraceEvent> {
-    const traceEvent: WorkflowTraceEvent = {
-      seq: this.nextTraceSeq(runDir),
-      at: new Date().toISOString(),
-      runId: state.runId,
-      ...event,
-    };
-    await this.appendJsonLine(path.join(runDir, TRACE_PATH), traceEvent);
-    return traceEvent;
-  }
-
-  private nextTraceSeq(runDir: string): number {
-    const next = (this.traceSeqByRun.get(runDir) ?? 0) + 1;
-    this.traceSeqByRun.set(runDir, next);
-    return next;
-  }
-
-  private async appendJsonLine(filePath: string, value: unknown): Promise<void> {
-    const prior = this.appendChainByPath.get(filePath) ?? Promise.resolve();
-    const nextWrite = prior.then(async () => {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.appendFile(filePath, value === null ? "" : `${JSON.stringify(value)}\n`, "utf8");
-    });
-    const tracked = nextWrite.finally(() => {
-      if (this.appendChainByPath.get(filePath) === tracked) {
-        this.appendChainByPath.delete(filePath);
-      }
-    });
-    this.appendChainByPath.set(filePath, tracked);
-    await tracked;
-  }
-}
-
 export type LoadedRunBundle = {
   runDir: string;
   manifest: WorkflowRunManifest;
@@ -136,45 +53,237 @@ export type LoadedRunBundle = {
   snapshot: WorkflowDefinitionSnapshot | null;
 };
 
+export interface Interface {
+  readonly outputRoot: string;
+  readonly runDirFor: (runId: string) => string;
+  readonly initializeRunBundle: (
+    workflow: WorkflowDefinition,
+    state: WorkflowRunState,
+  ) => Effect.Effect<string, PlatformError>;
+  readonly writeSnapshot: (
+    runDir: string,
+    state: WorkflowRunState,
+    event: WorkflowTraceEventDraft,
+  ) => Effect.Effect<WorkflowTraceEvent, PlatformError>;
+  readonly appendTrace: (
+    runDir: string,
+    state: WorkflowRunState,
+    event: WorkflowTraceEventDraft,
+  ) => Effect.Effect<WorkflowTraceEvent, PlatformError>;
+}
+
+export class Service extends Context.Service<Service, Interface>()(
+  "@pi-herdr-workflows/WorkflowRunStore",
+) {}
+
+/**
+ * Persists run bundles. A bundle directory contains `manifest.json`,
+ * `workflow.json` (definition snapshot), `state.json` (full run projection,
+ * atomically replaced), and `trace.ndjson` (append-only event log).
+ */
+export const make = (outputRoot: string = workflowRunsBaseDir()) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const traceSeqByRun = new Map<string, number>();
+    // Serialize appends per path so concurrent snapshot writes cannot interleave
+    // ndjson lines. Ceiling: one chain per path for the life of the store.
+    const appendChainByPath = new Map<string, Promise<void>>();
+
+    const runDirFor = (runId: string): string => path.join(outputRoot, runId);
+
+    const nextTraceSeq = (runDir: string): number => {
+      const next = (traceSeqByRun.get(runDir) ?? 0) + 1;
+      traceSeqByRun.set(runDir, next);
+      return next;
+    };
+
+    const appendJsonLine = (
+      filePath: string,
+      value: unknown,
+    ): Effect.Effect<void, PlatformError> =>
+      Effect.gen(function* () {
+        yield* fs.makeDirectory(path.dirname(filePath), { recursive: true });
+        const chunk = value === null ? "" : `${JSON.stringify(value)}\n`;
+        // Chain through a mutable promise map so concurrent Effect fibers still
+        // append in order for a given path.
+        yield* Effect.promise(() => {
+          const prior = appendChainByPath.get(filePath) ?? Promise.resolve();
+          const nextWrite = prior.then(() =>
+            Effect.runPromise(fs.writeFileString(filePath, chunk, { flag: "a" })),
+          );
+          const tracked = nextWrite.finally(() => {
+            if (appendChainByPath.get(filePath) === tracked) {
+              appendChainByPath.delete(filePath);
+            }
+          });
+          appendChainByPath.set(filePath, tracked);
+          return tracked;
+        });
+      });
+
+    const writeJsonAtomic = (
+      filePath: string,
+      value: unknown,
+    ): Effect.Effect<void, PlatformError> =>
+      Effect.gen(function* () {
+        const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+        yield* fs.makeDirectory(path.dirname(filePath), { recursive: true });
+        yield* fs.writeFileString(tempPath, `${JSON.stringify(value, null, 2)}\n`);
+        yield* fs.rename(tempPath, filePath);
+      });
+
+    const appendTrace = Effect.fn("WorkflowRunStore.appendTrace")(function* (
+      runDir: string,
+      state: WorkflowRunState,
+      event: WorkflowTraceEventDraft,
+    ) {
+      const traceEvent: WorkflowTraceEvent = {
+        seq: nextTraceSeq(runDir),
+        at: new Date().toISOString(),
+        runId: state.runId,
+        ...event,
+      };
+      yield* appendJsonLine(path.join(runDir, TRACE_PATH), traceEvent);
+      return traceEvent;
+    });
+
+    const writeSnapshot = Effect.fn("WorkflowRunStore.writeSnapshot")(function* (
+      runDir: string,
+      state: WorkflowRunState,
+      event: WorkflowTraceEventDraft,
+    ) {
+      state.updatedAt = new Date().toISOString();
+      yield* writeJsonAtomic(path.join(runDir, STATE_PATH), state);
+      yield* writeJsonAtomic(path.join(runDir, MANIFEST_PATH), createManifest(state));
+      return yield* appendTrace(runDir, state, event);
+    });
+
+    const initializeRunBundle = Effect.fn("WorkflowRunStore.initializeRunBundle")(
+      function* (workflow: WorkflowDefinition, state: WorkflowRunState) {
+        const runDir = runDirFor(state.runId);
+        yield* fs.makeDirectory(runDir, { recursive: true });
+        traceSeqByRun.set(runDir, 0);
+
+        yield* writeJsonAtomic(
+          path.join(runDir, WORKFLOW_SNAPSHOT_PATH),
+          createDefinitionSnapshot(workflow),
+        );
+        yield* writeJsonAtomic(path.join(runDir, MANIFEST_PATH), createManifest(state));
+        yield* writeJsonAtomic(path.join(runDir, STATE_PATH), state);
+        yield* appendJsonLine(path.join(runDir, TRACE_PATH), null);
+
+        return runDir;
+      },
+    );
+
+    return Service.of({
+      outputRoot,
+      runDirFor,
+      initializeRunBundle,
+      writeSnapshot,
+      appendTrace,
+    });
+  });
+
+export const layer = (outputRoot?: string) =>
+  Layer.effect(Service, make(outputRoot)).pipe(Layer.provide(NodeFileSystem.layer));
+
+/**
+ * Promise-facing store used by the engine facade. Methods run the Effect store
+ * against the Node filesystem layer.
+ */
+export class WorkflowRunStore {
+  readonly outputRoot: string;
+  private readonly service: Interface;
+
+  constructor(outputRoot: string = workflowRunsBaseDir()) {
+    this.outputRoot = outputRoot;
+    this.service = Effect.runSync(make(outputRoot).pipe(Effect.provide(NodeFileSystem.layer)));
+  }
+
+  runDirFor(runId: string): string {
+    return this.service.runDirFor(runId);
+  }
+
+  initializeRunBundle(
+    workflow: WorkflowDefinition,
+    state: WorkflowRunState,
+  ): Promise<string> {
+    return Effect.runPromise(this.service.initializeRunBundle(workflow, state));
+  }
+
+  writeSnapshot(
+    runDir: string,
+    state: WorkflowRunState,
+    event: WorkflowTraceEventDraft,
+  ): Promise<WorkflowTraceEvent> {
+    return Effect.runPromise(this.service.writeSnapshot(runDir, state, event));
+  }
+
+  appendTrace(
+    runDir: string,
+    state: WorkflowRunState,
+    event: WorkflowTraceEventDraft,
+  ): Promise<WorkflowTraceEvent> {
+    return Effect.runPromise(this.service.appendTrace(runDir, state, event));
+  }
+}
+
 /** Read a run bundle from disk. Returns null when the bundle is unreadable. */
 export async function readRunBundle(runDir: string): Promise<LoadedRunBundle | null> {
-  const manifest = await readJsonFile<WorkflowRunManifest>(path.join(runDir, MANIFEST_PATH));
-  const state = await readJsonFile<WorkflowRunState>(path.join(runDir, STATE_PATH));
-  if (!manifest || !state || manifest.schema !== RUN_BUNDLE_SCHEMA) {
-    return null;
-  }
-  const snapshot = await readJsonFile<WorkflowDefinitionSnapshot>(
-    path.join(runDir, WORKFLOW_SNAPSHOT_PATH),
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const manifest = yield* readJsonFile<WorkflowRunManifest>(
+        fs,
+        path.join(runDir, MANIFEST_PATH),
+      );
+      const state = yield* readJsonFile<WorkflowRunState>(fs, path.join(runDir, STATE_PATH));
+      if (!manifest || !state || manifest.schema !== RUN_BUNDLE_SCHEMA) {
+        return null;
+      }
+      const snapshot = yield* readJsonFile<WorkflowDefinitionSnapshot>(
+        fs,
+        path.join(runDir, WORKFLOW_SNAPSHOT_PATH),
+      );
+      return { runDir, manifest, state, snapshot };
+    }).pipe(Effect.provide(NodeFileSystem.layer)),
   );
-  return { runDir, manifest, state, snapshot };
 }
 
 /** List run bundles under `outputRoot`, most recently started first. */
 export async function listRunBundles(outputRoot: string): Promise<LoadedRunBundle[]> {
-  let entries: string[];
-  try {
-    entries = await fs.readdir(outputRoot);
-  } catch {
-    return [];
-  }
-  const bundles: LoadedRunBundle[] = [];
-  for (const entry of entries) {
-    const bundle = await readRunBundle(path.join(outputRoot, entry));
-    if (bundle) {
-      bundles.push(bundle);
-    }
-  }
-  bundles.sort((a, b) => b.state.startedAt.localeCompare(a.state.startedAt));
-  return bundles;
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const entries = yield* fs
+        .readDirectory(outputRoot)
+        .pipe(Effect.catch(() => Effect.succeed([] as string[])));
+      const bundles: LoadedRunBundle[] = [];
+      for (const entry of entries) {
+        const bundle = yield* Effect.promise(() =>
+          readRunBundle(path.join(outputRoot, entry)),
+        );
+        if (bundle) {
+          bundles.push(bundle);
+        }
+      }
+      bundles.sort((a, b) => b.state.startedAt.localeCompare(a.state.startedAt));
+      return bundles;
+    }).pipe(Effect.provide(NodeFileSystem.layer)),
+  );
 }
 
-async function readJsonFile<T>(filePath: string): Promise<T | null> {
-  try {
-    const raw = await fs.readFile(filePath, "utf8");
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
-  }
+export function createDefinitionSnapshot(workflow: WorkflowDefinition): WorkflowDefinitionSnapshot {
+  return {
+    schema: DEFINITION_SNAPSHOT_SCHEMA,
+    name: workflow.name,
+    startAt: workflow.startAt,
+    nodes: Object.fromEntries(
+      Object.entries(workflow.nodes).map(([nodeId, node]) => [nodeId, snapshotNode(node)]),
+    ),
+    edges: structuredClone(workflow.edges),
+  };
 }
 
 function createManifest(state: WorkflowRunState): WorkflowRunManifest {
@@ -193,18 +302,6 @@ function createManifest(state: WorkflowRunState): WorkflowRunManifest {
       state: STATE_PATH,
       trace: TRACE_PATH,
     },
-  };
-}
-
-export function createDefinitionSnapshot(workflow: WorkflowDefinition): WorkflowDefinitionSnapshot {
-  return {
-    schema: DEFINITION_SNAPSHOT_SCHEMA,
-    name: workflow.name,
-    startAt: workflow.startAt,
-    nodes: Object.fromEntries(
-      Object.entries(workflow.nodes).map(([nodeId, node]) => [nodeId, snapshotNode(node)]),
-    ),
-    edges: structuredClone(workflow.edges),
   };
 }
 
@@ -241,9 +338,12 @@ function snapshotNode(node: WorkflowNodeDefinition): WorkflowNodeSnapshot {
   return common;
 }
 
-async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
-  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await fs.rename(tempPath, filePath);
+function readJsonFile<T>(
+  fs: FileSystem.FileSystem,
+  filePath: string,
+): Effect.Effect<T | null> {
+  return Effect.gen(function* () {
+    const raw = yield* fs.readFileString(filePath);
+    return JSON.parse(raw) as T;
+  }).pipe(Effect.catch(() => Effect.succeed(null)));
 }

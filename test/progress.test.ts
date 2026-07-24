@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   buildNodeProgress,
+  formatActivityText,
   formatProgressText,
+  formatStepsHeader,
   orderWorkflowNodes,
+  plainStrikethrough,
+  resolveActivity,
   statusMark,
 } from "../src/extension/progress.ts";
 import { agent, compute, decision, decisionEdge, defineWorkflow } from "../src/index.ts";
@@ -104,7 +108,7 @@ test("buildNodeProgress only includes agent/decision nodes", () => {
   assert.equal(done.every((n) => n.nodeType === "agent"), true);
 });
 
-test("formatProgressText lists agent nodes with marks", () => {
+test("formatProgressText uses pi-tasks style icons and #N labels", () => {
   const nodes = buildNodeProgress({
     workflow,
     phase: "running",
@@ -119,23 +123,98 @@ test("formatProgressText lists agent nodes with marks", () => {
       },
     },
   });
-  const text = formatProgressText({
+  const snapshot = {
     workflowName: "file-parity-like",
-    phase: "running",
+    phase: "running" as const,
     elapsedMs: 160,
     message: "herdr agent prompt decide-ab12 --wait",
+    activity: "Odd or even total?",
     nodes,
     currentNodeId: "decide",
-  });
-  assert.match(text, /^file-parity-like · running · 0s$/m);
-  assert.match(text, new RegExp(`${statusMark("done")} listExamples  List examples/`));
-  assert.match(text, new RegExp(`${statusMark("running")} decide  Odd or even total\?`));
+    currentNodeType: "agent",
+  };
+  const text = formatProgressText(snapshot);
+  // Header: ● name · N steps (counts) · elapsed
+  assert.match(
+    text,
+    /^● file-parity-like · 3 steps \(2 done, 1 in progress\) · 0s$/m,
+  );
+  assert.equal(formatStepsHeader(snapshot), "● file-parity-like · 3 steps (2 done, 1 in progress) · 0s");
+  // Done lines use ✔ + strikethrough subject
+  assert.match(text, new RegExp(`  ${statusMark("done")} ${plainStrikethrough("#1 List examples/")}`));
+  assert.match(text, new RegExp(`  ${statusMark("done")} ${plainStrikethrough("#2 List skills/")}`));
+  // Running line uses Pi default braille spinner + activeForm ellipsis
+  assert.match(text, new RegExp(`  ${statusMark("running", 0)} #3 Odd or even total\\?…`));
   assert.equal(text.includes("herdr"), false);
   assert.equal(text.includes("tally"), false);
   assert.equal(text.includes("failEven"), false);
-  assert.equal(statusMark("pending"), "○");
-  assert.equal(statusMark("running"), "◉");
-  assert.equal(statusMark("done"), "✓");
+  assert.equal(statusMark("pending"), "◻");
+  assert.equal(statusMark("running", 0), "⠋");
+  assert.equal(statusMark("running", 1), "⠙");
+  assert.equal(statusMark("done"), "✔");
+  assert.equal(statusMark("failed"), "✗");
+});
+
+test("formatProgressText surfaces non-agent activity under the header", () => {
+  const nodes = buildNodeProgress({
+    workflow,
+    phase: "running",
+    currentNodeId: "tally",
+    state: {
+      currentNode: "tally",
+      status: "running",
+      results: {
+        listExamples: result("listExamples", "agent", "ok"),
+        listSkills: result("listSkills", "agent", "ok"),
+      },
+    },
+  });
+  const text = formatProgressText({
+    workflowName: "file-parity-like",
+    phase: "running",
+    elapsedMs: 45_000,
+    message: "updating workspace repos",
+    activity: "updating workspace repos",
+    nodes,
+    currentNodeId: "update_repos",
+    currentNodeType: "action",
+  });
+  assert.match(text, /  now  update_repos \(action\) · updating workspace repos/);
+  assert.match(text, new RegExp(`  ${statusMark("done")} ${plainStrikethrough("#1 List examples/")}`));
+});
+
+test("formatActivityText surfaces non-agent steps without the agent checklist", () => {
+  const nodes = buildNodeProgress({
+    workflow,
+    phase: "running",
+    currentNodeId: "tally",
+    state: {
+      currentNode: "tally",
+      status: "running",
+      results: {
+        listExamples: result("listExamples", "agent", "ok"),
+        listSkills: result("listSkills", "agent", "ok"),
+      },
+    },
+  });
+  const snapshot = {
+    workflowName: "file-parity-like",
+    phase: "running" as const,
+    elapsedMs: 45_000,
+    message: "updating workspace repos",
+    activity: "updating workspace repos",
+    nodes,
+    currentNodeId: "update_repos",
+    currentNodeType: "action",
+  };
+  const activity = formatActivityText(snapshot);
+  assert.equal(
+    activity,
+    "file-parity-like · running · 45s · update_repos (action) · updating workspace repos",
+  );
+  assert.equal(activity.includes("listExamples"), false);
+  assert.equal(activity.includes(statusMark("done")), false);
+  assert.equal(resolveActivity(snapshot), "updating workspace repos");
 });
 
 function result(

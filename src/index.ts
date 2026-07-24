@@ -1,5 +1,5 @@
 export * from "./workflows/index.js";
-export { HerdrClient, HerdrError, isHerdrError } from "./herdr/client.js";
+export { HerdrClient, HerdrError, isHerdrError, makeHerdrError } from "./herdr/client.js";
 export {
   DEFAULT_MAX_VALIDATION_ATTEMPTS,
   HerdrStepExecutor,

@@ -20,9 +20,11 @@ import { HerdrStepExecutor, type HerdrAgentWaitProgress } from "../herdr/executo
 import registerHerdrTool from "../herdr/tool.js";
 import {
   buildNodeProgress,
-  formatElapsed,
+  formatActivityText,
+  formatActivityThemed,
   formatProgressText,
   formatProgressThemed,
+  PI_DEFAULT_SPINNER_FRAMES,
   type WorkflowProgressSnapshot,
 } from "./progress.js";
 
@@ -77,11 +79,16 @@ export default function (pi: ExtensionAPI) {
         nodes: buildNodeProgress({ workflow, phase: "starting" }),
       };
 
-      const publish = (patch: Partial<WorkflowToolDetails>) => {
+      let spinnerFrame = 0;
+      const publish = (patch: Partial<WorkflowToolDetails>, options?: { advanceSpinner?: boolean }) => {
+        if (options?.advanceSpinner) {
+          spinnerFrame = (spinnerFrame + 1) % PI_DEFAULT_SPINNER_FRAMES.length;
+        }
         latest = {
           ...latest,
           ...patch,
           elapsedMs: Date.now() - startedAt,
+          spinnerFrame,
           nodes:
             patch.nodes ??
             buildNodeProgress({
@@ -91,14 +98,16 @@ export default function (pi: ExtensionAPI) {
               phase: patch.phase ?? latest.phase,
             }),
         };
-        const text = formatProgressText(latest);
+        // Split surfaces to kill the duplicate checklist:
+        // - sticky widget above the editor = agent checklist (live, animated)
+        // - in-chat tool partial = compact activity line (any node kind)
+        const activityText = formatActivityText(latest);
         onUpdate?.({
-          content: [{ type: "text", text }],
+          content: [{ type: "text", text: activityText }],
           details: latest,
         });
-        // Sticky live view above the editor; tool partial is the chat record.
         if (ctx.hasUI) {
-          ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, text.split("\n"));
+          ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, formatProgressText(latest).split("\n"));
         }
       };
       const onTrace = (event: WorkflowTraceEvent, state: WorkflowRunState) => {
@@ -108,7 +117,7 @@ export default function (pi: ExtensionAPI) {
       const onAgentProgress = (event: HerdrAgentWaitProgress) => {
         // Keep pane/agent ids for details, but don't surface raw herdr CLI text.
         // The one-liner comes from the node's statusDetail (or spawn.name).
-        const message =
+        const activity =
           event.phase === "blocked"
             ? "waiting for input"
             : event.phase === "validation_retry"
@@ -117,9 +126,10 @@ export default function (pi: ExtensionAPI) {
         publish({
           phase: "running",
           currentNodeId: event.nodeId,
+          currentNodeType: "agent",
           agentName: event.agentName,
           paneId: event.paneId,
-          ...(message ? { message } : {}),
+          ...(activity ? { activity, message: activity } : {}),
         });
       };
 
@@ -141,10 +151,13 @@ export default function (pi: ExtensionAPI) {
       running = true;
       const onAbort = () => activeEngine?.cancel();
       runSignal.addEventListener("abort", onAbort, { once: true });
-      // Tick so elapsed time stays fresh while a node is waiting on Herdr.
-      const ticker = onUpdate || ctx.hasUI
-        ? setInterval(() => publish({}), 1_000)
-        : undefined;
+      // Tick elapsed time + braille spinner for the sticky agent checklist.
+      // Spinner advances on a faster cadence (Pi Loader default ~80–120ms feel),
+      // elapsed still updates every tick via Date.now().
+      const ticker =
+        onUpdate || ctx.hasUI
+          ? setInterval(() => publish({}, { advanceSpinner: true }), 120)
+          : undefined;
 
       try {
         publish({
@@ -224,8 +237,11 @@ export default function (pi: ExtensionAPI) {
         component.setText(content?.type === "text" ? content.text : "");
         return component;
       }
-      // Live + settled both show the full node list; final adds runDir when expanded.
-      let text = formatProgressThemed(details, theme);
+      // Partial: compact activity only (widget owns the agent checklist).
+      // Settled: full agent checklist (widget is cleared in finally).
+      let text = isPartial
+        ? formatActivityThemed(details, theme)
+        : formatProgressThemed(details, theme);
       if (!isPartial && expanded && details.runDir) {
         text += `\n${theme.fg("dim", details.runDir)}`;
       }
@@ -326,34 +342,51 @@ function traceProgress(
 
   switch (event.type) {
     case "node_started": {
-      const node = workflow.nodes[event.nodeId ?? ""];
+      const nodeId = event.nodeId ?? "";
+      const node = workflow.nodes[nodeId];
       const detail =
         (typeof node?.statusDetail === "string" && node.statusDetail.trim()) ||
         (node?.nodeType === "agent" && typeof node.spawn?.name === "string"
           ? node.spawn.name
-          : undefined);
+          : undefined) ||
+        `Running ${nodeId}`;
       return {
         ...base,
         phase: "running",
-        message: detail ?? `Running ${event.nodeId}`,
+        currentNodeId: nodeId || undefined,
+        currentNodeType: node?.nodeType,
+        activity: detail,
+        message: detail,
       };
     }
     case "node_finished":
       return {
         ...base,
         phase: "running",
-        message: "",
+        // Keep last activity until the next node_started overwrites it.
+        currentNodeType: undefined,
       };
     case "node_failed":
       return {
         ...base,
         phase: "failed",
+        activity: `Failed: ${String(event.payload.error ?? "unknown")}`,
         message: `Failed: ${String(event.payload.error ?? "unknown")}`,
       };
     case "run_paused":
-      return { ...base, phase: "waiting", message: "Workflow paused at a step boundary" };
+      return {
+        ...base,
+        phase: "waiting",
+        activity: "Workflow paused at a step boundary",
+        message: "Workflow paused at a step boundary",
+      };
     case "run_resumed":
-      return { ...base, phase: "running", message: "Workflow resumed" };
+      return {
+        ...base,
+        phase: "running",
+        activity: "Workflow resumed",
+        message: "Workflow resumed",
+      };
     default:
       return base;
   }

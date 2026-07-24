@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { CancelledError, TimeoutError } from "./errors.js";
+import { cancelledError, timeoutError } from "./errors.js";
 import type { ShellActionExecution, ShellActionResult } from "./types.js";
 
 /** Default cap on captured stdout/stderr, each. */
@@ -33,10 +33,10 @@ function shellFailure(
   killedBy: "timeout" | "abort" | null,
 ): Error | undefined {
   if (killedBy === "timeout") {
-    return new TimeoutError(spec.timeoutMs ?? 0);
+    return timeoutError(spec.timeoutMs ?? 0);
   }
   if (killedBy === "abort") {
-    return new CancelledError();
+    return cancelledError();
   }
   if (((result.exitCode ?? 0) !== 0 || result.signal != null) && spec.allowNonZeroExit !== true) {
     const status = result.signal ? `signal ${result.signal}` : `exit ${String(result.exitCode)}`;
@@ -55,7 +55,7 @@ export async function runShellAction(
   // The node may have been cancelled while an async `exec` callback resolved;
   // never start side effects for an already-abandoned attempt.
   if (signal?.aborted) {
-    throw new CancelledError();
+    throw cancelledError();
   }
   const cwd = spec.cwd ?? process.cwd();
   const args = spec.args ?? [];

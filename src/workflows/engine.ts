@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { CancelledError, errorMessage, isAbortLikeError, TimeoutError } from "./errors.js";
+import { Deferred, Effect } from "effect";
+import {
+  CancelledError,
+  cancelledError,
+  errorMessage,
+  isAbortLikeError,
+  isTimeoutError,
+  timeoutError,
+} from "./errors.js";
 import { resolveNext, resolveNextForOutcome, validateWorkflowDefinition } from "./graph.js";
 import { extractJsonValue } from "./json.js";
 import { runShellAction, shellResultFromError } from "./shell.js";
@@ -69,6 +77,8 @@ export class WorkflowEngine {
   private activeAbort: AbortController | null = null;
   private cancelled = false;
   private paused = false;
+  /** Effect pause gate: waiting fibers await this Deferred; resume/cancel complete it. */
+  private pauseGate: Deferred.Deferred<void> | null = null;
   private wakePause: (() => void) | null = null;
 
   constructor(options: WorkflowEngineOptions) {
@@ -86,10 +96,13 @@ export class WorkflowEngine {
   /** Abort the currently running node and mark the run cancelled. */
   cancel(): void {
     this.cancelled = true;
-    this.activeAbort?.abort(new CancelledError());
+    this.activeAbort?.abort(cancelledError());
     // A run held at a pause boundary has no active node to abort; wake it so
     // it can observe the cancellation.
     this.wakePause?.();
+    if (this.pauseGate) {
+      Effect.runFork(Deferred.succeed(this.pauseGate, undefined));
+    }
   }
 
   /**
@@ -104,11 +117,29 @@ export class WorkflowEngine {
   resume(): void {
     this.paused = false;
     this.wakePause?.();
+    if (this.pauseGate) {
+      Effect.runFork(Deferred.succeed(this.pauseGate, undefined));
+    }
   }
 
   /** True when a pause has been requested or the run is already held. */
   get pauseRequested(): boolean {
     return this.paused;
+  }
+
+  /**
+   * Effect form of {@link run}. Composition roots may provide this into larger
+   * Effect programs; the Promise facade is a thin `Effect.runPromise` wrapper.
+   */
+  runEffect(
+    workflow: WorkflowDefinition,
+    input: unknown,
+    options: { workflowPath?: string } = {},
+  ): Effect.Effect<WorkflowRunResult, Error> {
+    return Effect.tryPromise({
+      try: () => this.run(workflow, input, options),
+      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
+    });
   }
 
   async run(
@@ -123,6 +154,7 @@ export class WorkflowEngine {
     assertJsonSerializable(normalizedInput, "Workflow run input");
     this.cancelled = false;
     this.paused = false;
+    this.pauseGate = null;
 
     const state = await this.createRunState(workflow, normalizedInput, options.workflowPath);
     const runDir = await this.store.initializeRunBundle(workflow, state);
@@ -162,7 +194,7 @@ export class WorkflowEngine {
     const abort = new AbortController();
     this.activeAbort = abort;
     const timer = setTimeout(
-      () => abort.abort(new TimeoutError(TITLE_TIMEOUT_MS)),
+      () => abort.abort(timeoutError(TITLE_TIMEOUT_MS)),
       TITLE_TIMEOUT_MS,
     );
     try {
@@ -262,7 +294,7 @@ export class WorkflowEngine {
    */
   private async holdWhilePaused(state: WorkflowRunState, runDir: string): Promise<void> {
     if (this.cancelled) {
-      throw new CancelledError();
+      throw cancelledError();
     }
     if (!this.paused) {
       return;
@@ -270,14 +302,22 @@ export class WorkflowEngine {
     state.paused = true;
     await this.persist(runDir, state, { scope: "run", type: "run_paused", payload: {} });
     while (this.paused && !this.cancelled) {
-      await new Promise<void>((resolve) => {
-        this.wakePause = resolve;
-      });
+      // Deferred is the Effect-native pause gate; keep the Promise wake path so
+      // cancel/resume from outside an Effect program still unblocks the loop.
+      const gate = Effect.runSync(Deferred.make<void>());
+      this.pauseGate = gate;
+      await Promise.race([
+        Effect.runPromise(Deferred.await(gate)),
+        new Promise<void>((resolve) => {
+          this.wakePause = resolve;
+        }),
+      ]);
+      this.wakePause = null;
+      this.pauseGate = null;
     }
-    this.wakePause = null;
     delete state.paused;
     if (this.cancelled) {
-      throw new CancelledError();
+      throw cancelledError();
     }
     await this.persist(runDir, state, { scope: "run", type: "run_resumed", payload: {} });
   }
@@ -292,7 +332,7 @@ export class WorkflowEngine {
       return next;
     }
     if (attempt.result.outcome === "cancelled" || this.cancelled) {
-      throw new CancelledError();
+      throw cancelledError();
     }
     if (attempt.result.outcome === "timed_out") {
       state.status = "timed_out";
@@ -391,7 +431,7 @@ export class WorkflowEngine {
   }
 
   private outcomeForError(error: unknown): WorkflowNodeOutcome {
-    if (error instanceof TimeoutError) {
+    if (isTimeoutError(error)) {
       return "timed_out";
     }
     if (this.cancelled || isAbortLikeError(error)) {
@@ -434,11 +474,11 @@ export class WorkflowEngine {
     const abort = new AbortController();
     this.activeAbort = abort;
     if (this.cancelled) {
-      throw new CancelledError();
+      throw cancelledError();
     }
 
     const timer = setTimeout(() => {
-      abort.abort(new TimeoutError(timeoutMs));
+      abort.abort(timeoutError(timeoutMs));
     }, timeoutMs);
     const dispatched = this.dispatchNode(
       workflow,
@@ -475,7 +515,7 @@ export class WorkflowEngine {
         ]);
       }
       const reason: unknown = abort.signal.aborted ? abort.signal.reason : undefined;
-      throw reason instanceof TimeoutError || reason instanceof CancelledError ? reason : error;
+      throw isTimeoutError(reason) || reason instanceof CancelledError ? reason : error;
     } finally {
       clearTimeout(timer);
       this.activeAbort = null;
@@ -710,8 +750,8 @@ async function runShellActionNode(
 /** Rejects with the abort reason once the signal fires; never resolves. */
 /** The error carried by an aborted signal, normalized to an Error. */
 function abortError(signal: AbortSignal): Error {
-  const reason: unknown = signal.reason ?? new CancelledError();
-  return reason instanceof Error ? reason : new CancelledError(String(reason));
+  const reason: unknown = signal.reason ?? cancelledError();
+  return reason instanceof Error ? reason : cancelledError(String(reason));
 }
 
 function abortRejection(signal: AbortSignal): Promise<never> {
@@ -817,8 +857,10 @@ async function resolveAgentSpawn(
     ...(spawn.skills !== undefined ? { skills: spawn.skills } : {}),
     ...(spawn.tools !== undefined ? { tools: spawn.tools } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
+    ...(spawn.kind !== undefined ? { kind: spawn.kind } : {}),
     fork: spawn.fork === true,
     ...(spawn.interactive !== undefined ? { interactive: spawn.interactive } : {}),
+    closePaneAfterDone: spawn.closePaneAfterDone === true,
   };
 }
 

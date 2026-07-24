@@ -69,8 +69,12 @@ function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): 
   assertOptionalString(spawn.skills, `node ${nodeId} spawn.skills`);
   assertOptionalString(spawn.tools, `node ${nodeId} spawn.tools`);
   assertStringOrFn(spawn.cwd, `node ${nodeId} spawn.cwd`);
+  if (spawn.kind !== undefined && spawn.kind !== "pi" && spawn.kind !== "pi-wiz") {
+    fail(`node ${nodeId} spawn.kind must be "pi" or "pi-wiz"`);
+  }
   assertOptionalBoolean(spawn.fork, `node ${nodeId} spawn.fork`);
   assertOptionalBoolean(spawn.interactive, `node ${nodeId} spawn.interactive`);
+  assertOptionalBoolean(spawn.closePaneAfterDone, `node ${nodeId} spawn.closePaneAfterDone`);
 }
 
 function assertOptionalString(value: unknown, description: string): void {
