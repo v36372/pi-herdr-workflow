@@ -66,6 +66,7 @@ function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): 
   assertOptionalString(spawn.agent, `node ${nodeId} spawn.agent`);
   assertStringOrFn(spawn.systemPrompt, `node ${nodeId} spawn.systemPrompt`);
   assertOptionalString(spawn.model, `node ${nodeId} spawn.model`);
+  assertOptionalString(spawn.thinking, `node ${nodeId} spawn.thinking`);
   assertOptionalString(spawn.skills, `node ${nodeId} spawn.skills`);
   assertOptionalString(spawn.tools, `node ${nodeId} spawn.tools`);
   assertStringOrFn(spawn.cwd, `node ${nodeId} spawn.cwd`);

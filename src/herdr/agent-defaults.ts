@@ -74,7 +74,9 @@ export function resolveAgentLaunch(
 
   return {
     spawn: effectiveSpawn,
-    ...(definition?.thinking ? { thinking: definition.thinking } : {}),
+    ...(spawn.thinking ?? definition?.thinking
+      ? { thinking: spawn.thinking ?? definition?.thinking }
+      : {}),
     ...(replaceSystemPrompt ? { replaceSystemPrompt } : {}),
     appendSystemPrompts,
     ...(rolePrompt ? { rolePrompt } : {}),

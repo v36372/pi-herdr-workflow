@@ -854,6 +854,7 @@ async function resolveAgentSpawn(
     ...(spawn.agent !== undefined ? { agent: spawn.agent } : {}),
     ...(systemPrompt !== undefined ? { systemPrompt } : {}),
     ...(spawn.model !== undefined ? { model: spawn.model } : {}),
+    ...(spawn.thinking !== undefined ? { thinking: spawn.thinking } : {}),
     ...(spawn.skills !== undefined ? { skills: spawn.skills } : {}),
     ...(spawn.tools !== undefined ? { tools: spawn.tools } : {}),
     ...(cwd !== undefined ? { cwd } : {}),

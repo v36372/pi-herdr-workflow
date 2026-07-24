@@ -20,8 +20,6 @@ import { HerdrStepExecutor, type HerdrAgentWaitProgress } from "../herdr/executo
 import registerHerdrTool from "../herdr/tool.js";
 import {
   buildNodeProgress,
-  formatActivityText,
-  formatActivityThemed,
   formatProgressText,
   formatProgressThemed,
   PI_DEFAULT_SPINNER_FRAMES,
@@ -98,17 +96,11 @@ export default function (pi: ExtensionAPI) {
               phase: patch.phase ?? latest.phase,
             }),
         };
-        // Split surfaces to kill the duplicate checklist:
-        // - sticky widget above the editor = agent checklist (live, animated)
-        // - in-chat tool partial = compact activity line (any node kind)
-        const activityText = formatActivityText(latest);
+        // Live step checklist lives in the tool call partial (not a sticky widget).
         onUpdate?.({
-          content: [{ type: "text", text: activityText }],
+          content: [{ type: "text", text: formatProgressText(latest) }],
           details: latest,
         });
-        if (ctx.hasUI) {
-          ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, formatProgressText(latest).split("\n"));
-        }
       };
       const onTrace = (event: WorkflowTraceEvent, state: WorkflowRunState) => {
         latestState = state;
@@ -151,13 +143,12 @@ export default function (pi: ExtensionAPI) {
       running = true;
       const onAbort = () => activeEngine?.cancel();
       runSignal.addEventListener("abort", onAbort, { once: true });
-      // Tick elapsed time + braille spinner for the sticky agent checklist.
+      // Tick elapsed time + braille spinner on the in-chat tool partial.
       // Spinner advances on a faster cadence (Pi Loader default ~80–120ms feel),
       // elapsed still updates every tick via Date.now().
-      const ticker =
-        onUpdate || ctx.hasUI
-          ? setInterval(() => publish({}, { advanceSpinner: true }), 120)
-          : undefined;
+      const ticker = onUpdate
+        ? setInterval(() => publish({}, { advanceSpinner: true }), 120)
+        : undefined;
 
       try {
         publish({
@@ -209,6 +200,7 @@ export default function (pi: ExtensionAPI) {
         runSignal.removeEventListener("abort", onAbort);
         running = false;
         if (ctx.hasUI) {
+          // Clear any leftover sticky widget from older package versions.
           ctx.ui.setWidget(WORKFLOW_WIDGET_KEY, undefined);
         }
         try {
@@ -237,11 +229,8 @@ export default function (pi: ExtensionAPI) {
         component.setText(content?.type === "text" ? content.text : "");
         return component;
       }
-      // Partial: compact activity only (widget owns the agent checklist).
-      // Settled: full agent checklist (widget is cleared in finally).
-      let text = isPartial
-        ? formatActivityThemed(details, theme)
-        : formatProgressThemed(details, theme);
+      // Partial and settled both show the step checklist inside the tool result.
+      let text = formatProgressThemed(details, theme);
       if (!isPartial && expanded && details.runDir) {
         text += `\n${theme.fg("dim", details.runDir)}`;
       }

@@ -58,6 +58,8 @@ export type AgentSpawnParams = {
   systemPrompt?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
   /** Model override. */
   model?: string;
+  /** Thinking level override (e.g. `low`, `medium`, `high`). */
+  thinking?: string;
   /** Comma-separated skill names eagerly expanded into the child task. */
   skills?: string;
   /** Comma-separated native tool names. */
@@ -97,6 +99,7 @@ export type ResolvedAgentSpawn = {
   agent?: string;
   systemPrompt?: string;
   model?: string;
+  thinking?: string;
   skills?: string;
   tools?: string;
   cwd?: string;

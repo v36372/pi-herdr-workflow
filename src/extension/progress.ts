@@ -27,8 +27,8 @@ export type WorkflowProgressSnapshot = {
   status?: WorkflowRunState["status"];
   runDir?: string;
   /**
-   * Spinner frame index for the live running mark. The sticky widget advances
-   * this; plain text / tool partials may leave it unset (static first frame).
+   * Spinner frame index for the live running mark. The tool partial ticker
+   * advances this; static renders may leave it unset (first frame).
    */
   spinnerFrame?: number;
 };
@@ -230,8 +230,8 @@ export function formatStepsHeader(snapshot: WorkflowProgressSnapshot): string {
 }
 
 /**
- * Compact live status for the in-chat tool partial.
- * Intentionally NOT the agent checklist — that lives in the sticky widget only.
+ * Compact one-line status. Kept for tests and callers that want a single line;
+ * the live tool partial uses {@link formatProgressText} (full checklist).
  */
 export function formatActivityText(snapshot: WorkflowProgressSnapshot): string {
   const parts = [
@@ -271,7 +271,7 @@ export function plainStrikethrough(text: string): string {
 }
 
 /**
- * Agent checklist for the sticky editor widget (and final settled tool result).
+ * Step checklist for the in-chat tool call (partial updates + settled result).
  * Visual language from @tintinweb/pi-tasks + Pi default braille spinner:
  *   ● N steps (counts)
  *     ✔ #1 done subject   (strikethrough)
@@ -314,7 +314,7 @@ function isHerdrNoise(message: string): boolean {
   return /\bherdr\b/i.test(message) || /\bagent (start|prompt|wait)\b/i.test(message);
 }
 
-/** Compact themed line for partial tool results (no agent checklist). */
+/** Compact themed one-liner (optional surface; tool partial uses full checklist). */
 export function formatActivityThemed(snapshot: WorkflowProgressSnapshot, theme: ThemeLike): string {
   const phaseColor =
     snapshot.phase === "completed"

@@ -1,25 +1,36 @@
 import { agent, defineWorkflow } from "pi-herdr-workflows";
+import { CHEAP } from "./_cheap.js";
 
 /**
- * Minimal example: one agent node with subagent-style spawn params.
- * When run via the extension, Herdr opens a workspace, puts the agent in a
- * pane, and the child calls workflow_done with { reply }.
+ * Minimal agent node. Child calls workflow_done with { reply }.
+ *
+ * Run: /workflow echo say hello in one sentence
  */
 export default defineWorkflow({
   name: "echo",
   startAt: "reply",
+  presentationPrompt: "Present the reply in one short line.",
   nodes: {
     reply: agent({
+      statusDetail: "Answering",
       spawn: {
         name: "echo-agent",
-        // agent: "worker", // optional: load project/global agents/worker.md defaults
-        // model: "anthropic/claude-sonnet-4-6",
-        // tools: "read,bash,grep,find,ls",
-        // cwd: process.cwd(),
+        ...CHEAP,
+        tools: "workflow_done",
       },
       prompt: ({ input }) =>
         `Answer concisely: ${(input as { task?: string }).task ?? "say hello"}`,
       expectedOutput: `{ "reply": "your concise answer" }`,
+      validate: (output) => {
+        if (output == null || typeof output !== "object" || Array.isArray(output)) {
+          throw new Error("output must be an object");
+        }
+        const reply = (output as { reply?: unknown }).reply;
+        if (typeof reply !== "string" || !reply.trim()) {
+          throw new Error("reply must be a non-empty string");
+        }
+        return { reply: reply.trim() };
+      },
     }),
   },
   edges: [],
