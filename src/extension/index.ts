@@ -1,23 +1,52 @@
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
+  SettingsManager,
   truncateHead,
   type ExtensionAPI,
+  type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import {
   WorkflowEngine,
   discoverWorkflows,
   loadWorkflowFile,
   resolveWorkflowRef,
+  type DiscoveredWorkflow,
   type WorkflowDefinition,
   type WorkflowRunState,
   type WorkflowTraceEvent,
 } from "../workflows/index.js";
 import { HerdrStepExecutor, type HerdrAgentWaitProgress } from "../herdr/executor.js";
 import registerHerdrTool from "../herdr/tool.js";
+import {
+  applyModelOverrides,
+  buildAgentModelMenuOptions,
+  buildWorkflowLaunchPrompt,
+  filterModelRefsByScope,
+  formatModelRef,
+  formatWorkflowOption,
+  isDoneAgentModelsOption,
+  isResetAgentModelsOption,
+  listAgentSteps,
+  modelInputHint,
+  modelInputTitle,
+  parseAgentStepOption,
+  parseWorkflowOption,
+  resolveModelInput,
+  type WorkflowAgentStep,
+  type WorkflowLaunchInvocation,
+  type WorkflowModelOverrides,
+} from "./launch.js";
+import { AgentModelEditor, type AgentModelEditorResult } from "./model-editor.js";
+
+/** Bump when launch UX changes so a stale /reload is obvious. */
+const LAUNCH_UX_VERSION = "v4-vim";
+const EXTENSION_FILE = fileURLToPath(import.meta.url);
 import {
   buildNodeProgress,
   formatProgressText,
@@ -56,6 +85,12 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       name: Type.String({ description: "Discovered workflow name or workflow file path" }),
       input: Type.Optional(Type.Unknown({ description: "JSON input passed to the workflow" })),
+      modelOverrides: Type.Optional(
+        Type.Record(Type.String(), Type.String(), {
+          description:
+            "Optional per-agent-node model overrides as provider/id (e.g. openai-codex/gpt-5.6-luna). Omitted nodes keep their workflow/agent defaults.",
+        }),
+      ),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -65,7 +100,8 @@ export default function (pi: ExtensionAPI) {
       if (running) throw new Error("A workflow is already running.");
 
       const resolved = await resolveWorkflowRef(params.name, { cwd: ctx.cwd });
-      const workflow = await loadWorkflowFile(resolved.path);
+      const loaded = await loadWorkflowFile(resolved.path);
+      const workflow = applyModelOverrides(loaded, params.modelOverrides);
       const runSignal = signal ?? new AbortController().signal;
       const startedAt = Date.now();
       let latestState: WorkflowRunState | undefined;
@@ -240,15 +276,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("workflow", {
-    description: "Ask the orchestrator to run a deterministic workflow through Herdr agents.",
+    description: `Pick/run a workflow (${LAUNCH_UX_VERSION} agent-model overlay). Subcommands: list, pause, resume, cancel.`,
     async handler(args, ctx) {
       const raw = (args ?? "").trim();
-      if (!raw || raw === "list") {
+      if (raw === "list") {
         const found = await discoverWorkflows({ cwd: ctx.cwd });
+        const mtime = existsSync(EXTENSION_FILE)
+          ? statSync(EXTENSION_FILE).mtime.toISOString()
+          : "?";
         ctx.ui.notify(
-          found.length
-            ? `Workflows:\n${found.map((item) => `- ${item.name}  (${item.path})`).join("\n")}`
-            : "No workflows found in .pi/workflows or ~/.pi/agent/workflows",
+          [
+            `pi-herdr-workflows launch ${LAUNCH_UX_VERSION}`,
+            `extension: ${EXTENSION_FILE}`,
+            `mtime: ${mtime}`,
+            found.length
+              ? `Workflows:\n${found.map((item) => `- ${item.name}  (${item.path})`).join("\n")}`
+              : "No workflows found in .pi/workflows or ~/.pi/agent/workflows",
+          ].join("\n"),
           "info",
         );
         return;
@@ -273,9 +317,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      let invocation: { name: string; input: unknown };
+      let invocation: WorkflowLaunchInvocation | undefined;
       try {
-        invocation = parseInvocation(raw);
+        invocation = raw ? parseInvocation(raw) : await promptWorkflowLaunch(ctx);
+        if (!invocation) return; // cancelled menu
         await resolveWorkflowRef(invocation.name, { cwd: ctx.cwd });
       } catch (error) {
         ctx.ui.notify(String(error), "error");
@@ -285,16 +330,167 @@ export default function (pi: ExtensionAPI) {
       pi.sendUserMessage([
         {
           type: "text",
-          text: [
-            `Run the deterministic workflow ${JSON.stringify(invocation.name)} now.`,
-            "Call the `workflow` tool exactly once with these arguments:",
-            JSON.stringify(invocation),
-            "The tool itself follows the workflow file, dispatches Herdr agents, waits for their lifecycle signals, and streams progress. Do not execute workflow nodes manually. After it returns, present the result.",
-          ].join("\n"),
+          text: buildWorkflowLaunchPrompt(invocation),
         },
       ]);
     },
   });
+}
+
+/**
+ * Interactive /workflow launcher: pick a discovered workflow, optionally set
+ * agent models, optionally supply a task string, then return a tool invocation.
+ */
+async function promptWorkflowLaunch(
+  ctx: ExtensionCommandContext,
+): Promise<WorkflowLaunchInvocation | undefined> {
+  if (!ctx.hasUI) {
+    const found = await discoverWorkflows({ cwd: ctx.cwd });
+    throw new Error(
+      found.length
+        ? `No UI available. Run /workflow <name> [task]. Available: ${found.map((item) => item.name).join(", ")}`
+        : "No UI available and no workflows found.",
+    );
+  }
+
+  const found = await discoverWorkflows({ cwd: ctx.cwd });
+  if (found.length === 0) {
+    ctx.ui.notify("No workflows found in .pi/workflows or ~/.pi/agent/workflows", "info");
+    return undefined;
+  }
+
+  const selectedOption = await ctx.ui.select(
+    "Select workflow",
+    found.map((item) => formatWorkflowOption(item)),
+  );
+  if (!selectedOption) return undefined;
+
+  const selected = findDiscoveredWorkflow(found, parseWorkflowOption(selectedOption));
+  if (!selected) {
+    throw new Error(`Unknown workflow selection: ${selectedOption}`);
+  }
+
+  const definition = await loadWorkflowFile(selected.path);
+  // undefined = cancelled a model dialog; {} = keep authored defaults.
+  const modelOverrides = await promptModelOverrides(ctx, definition);
+  if (modelOverrides === undefined) return undefined;
+
+  const task = await ctx.ui.input("Task / input (optional, Enter to skip)", "");
+  if (task === undefined) return undefined;
+
+  const invocation: WorkflowLaunchInvocation = {
+    name: selected.name,
+    input: task.trim() ? { task: task.trim() } : {},
+  };
+  if (Object.keys(modelOverrides).length > 0) {
+    invocation.modelOverrides = modelOverrides;
+  }
+  return invocation;
+}
+
+/**
+ * Floating agent-model editor (custom overlay).
+ * Falls back to a select loop if custom/overlay is unavailable.
+ * Returns `{}` for defaults, a map for overrides, or `undefined` on Esc cancel.
+ */
+async function promptModelOverrides(
+  ctx: ExtensionCommandContext,
+  workflow: WorkflowDefinition,
+): Promise<WorkflowModelOverrides | undefined> {
+  const settings = SettingsManager.create(ctx.cwd, undefined, {
+    projectTrusted: ctx.isProjectTrusted(),
+  });
+  const defaultProvider = settings.getDefaultProvider();
+  const defaultModelId = settings.getDefaultModel();
+  const piDefaultModel =
+    defaultProvider && defaultModelId
+      ? formatModelRef({ provider: defaultProvider, id: defaultModelId })
+      : ctx.model
+        ? formatModelRef(ctx.model)
+        : undefined;
+  const steps = listAgentSteps(workflow, piDefaultModel);
+  if (steps.length === 0) return {};
+
+  // Visible fingerprint so a stale session is obvious.
+  ctx.ui.notify(
+    `pi-herdr-workflows ${LAUNCH_UX_VERSION} · ${steps.length} agent step${steps.length === 1 ? "" : "s"} · ${path.basename(EXTENSION_FILE)}`,
+    "info",
+  );
+
+  const modelSuggestions = filterModelRefsByScope(
+    ctx.modelRegistry.getAvailable(),
+    settings.getEnabledModels(),
+  );
+
+  try {
+    const result = await ctx.ui.custom<AgentModelEditorResult>(
+      (tui, theme, _keybindings, done) =>
+        new AgentModelEditor({
+          theme,
+          workflowName: workflow.name,
+          steps,
+          modelSuggestions,
+          done,
+          requestRender: () => tui.requestRender(),
+        }),
+      { overlay: true },
+    );
+    if (!result || result.kind === "cancelled") return undefined;
+    return result.overrides;
+  } catch (error) {
+    ctx.ui.notify(
+      `Overlay model editor failed (${error instanceof Error ? error.message : String(error)}). Falling back to step list.`,
+      "warning",
+    );
+    return await promptModelOverridesSelectFallback(ctx, workflow, steps);
+  }
+}
+
+/** Select-based fallback if custom overlay cannot run. */
+async function promptModelOverridesSelectFallback(
+  ctx: ExtensionCommandContext,
+  workflow: WorkflowDefinition,
+  steps: WorkflowAgentStep[],
+): Promise<WorkflowModelOverrides | undefined> {
+  const stepsById = new Map(steps.map((step) => [step.nodeId, step]));
+  const overrides: WorkflowModelOverrides = {};
+
+  while (true) {
+    const choice = await ctx.ui.select(
+      `Agent models (${LAUNCH_UX_VERSION} fallback) · ${workflow.name}`,
+      buildAgentModelMenuOptions(steps, overrides),
+    );
+    if (!choice) return undefined;
+    if (isDoneAgentModelsOption(choice)) return overrides;
+    if (isResetAgentModelsOption(choice)) {
+      for (const key of Object.keys(overrides)) delete overrides[key];
+      continue;
+    }
+
+    const step = stepsById.get(parseAgentStepOption(choice));
+    if (!step) continue;
+
+    const raw = await ctx.ui.input(modelInputTitle(step), modelInputHint(step));
+    const resolved = resolveModelInput(raw, step.defaultModel);
+    if (resolved.kind === "override") {
+      overrides[step.nodeId] = resolved.model;
+    } else {
+      delete overrides[step.nodeId];
+      if (resolved.kind === "invalid") {
+        ctx.ui.notify(
+          `Invalid model ${JSON.stringify(resolved.raw)}; kept default for ${step.nodeId}.`,
+          "warning",
+        );
+      }
+    }
+  }
+}
+
+function findDiscoveredWorkflow(
+  found: DiscoveredWorkflow[],
+  name: string,
+): DiscoveredWorkflow | undefined {
+  return found.find((item) => item.name === name);
 }
 
 function parseInvocation(raw: string): { name: string; input: unknown } {

@@ -88,10 +88,13 @@ pi install file:./pi-herdr-workflows
 Requires: pi ≥ 0.80 and Herdr ≥ 0.7.5 on PATH, with pi running inside a Herdr session.
 
 ```bash
+/workflow                 # float menu: pick workflow, optional agent models, optional task
 /workflow list
 /workflow echo summarize this repo
 /workflow pause | resume | cancel
 ```
+
+Bare `/workflow` opens float menus: pick a discovered workflow, then a **custom overlay** listing every agent step. In the list, `j`/`k` (or ↑/↓) move, Enter edits a step, and `q`/Esc accepts the current configuration and exits. While editing, typing filters autocomplete suggestions from Pi's configured scoped models, ↑/↓ or Ctrl-j/k chooses, Tab completes, Enter applies, and Esc cancels that edit while keeping its previous override/default. Steps without an authored model show Pi's effective configured `provider/id` instead of a generic workflow-default label. Empty or invalid input keeps the step's default. Overrides are passed as `modelOverrides` into the `workflow` tool.
 
 The visible conversation flow is: user `/workflow` request → orchestrator `workflow` tool call → streaming progress → tool result → orchestrator presentation.
 

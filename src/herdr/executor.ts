@@ -241,6 +241,7 @@ export class HerdrStepExecutor implements AgentStepExecutor {
       appendSystemPrompts: launch.appendSystemPrompts,
     };
     const agentName = liveAgentName(spawn.name, contract.attemptId);
+    let closedPane = false;
 
     try {
       await this.prepareAgentEnvironment(paneId, startContext, signal);
@@ -321,9 +322,10 @@ export class HerdrStepExecutor implements AgentStepExecutor {
           });
           // Opt-in: close the agent pane after a successful submission so
           // collaborative workflows can leave panes open by default.
-          if (spawn.closePaneAfterDone) {
+          if (spawn.closePaneAfterDone && paneId !== this.rootPaneId) {
             try {
               await this.client.paneClose(paneId, signal);
+              closedPane = true;
             } catch {
               // Best-effort; run layout cleanup still happens on dispose.
             }
@@ -342,7 +344,7 @@ export class HerdrStepExecutor implements AgentStepExecutor {
         `Agent output rejected after ${this.maxValidationAttempts} submission(s): ${lastValidationError}`,
       );
     } finally {
-      this.lastPaneId = paneId;
+      this.lastPaneId = closedPane ? this.rootPaneId : paneId;
       // agent.start can steal UI focus into the run workspace; put the user
       // back on the orchestrator between steps and before dispose/close.
       await this.restoreOriginFocus(signal);

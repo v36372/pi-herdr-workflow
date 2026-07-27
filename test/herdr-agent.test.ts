@@ -682,11 +682,18 @@ test("spawn.kind pi-wiz still starts Herdr kind pi and sources wiz env", async (
   }
 });
 
-test("spawn.closePaneAfterDone closes the pane after workflow_done", async () => {
+test("spawn.closePaneAfterDone keeps the last pane open", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "phw-close-pane-"));
-  const artifactDir = path.join(root, "agents", "worker", "12345678-abcd");
-  const resultPath = path.join(artifactDir, "result.json");
+  const attempts = ["11111111-abcd", "22222222-abcd", "33333333-abcd"].map(
+    (attemptId, index) => {
+      const nodeId = `worker-${index + 1}`;
+      const artifactDir = path.join(root, "agents", nodeId, attemptId);
+      return { nodeId, attemptId, artifactDir, resultPath: path.join(artifactDir, "result.json") };
+    },
+  );
   const calls: string[][] = [];
+  let promptIndex = 0;
+  let splitCount = 0;
   const client = new HerdrClient({
     exec: async (args) => {
       calls.push(args);
@@ -696,12 +703,17 @@ test("spawn.closePaneAfterDone closes the pane after workflow_done", async () =>
           root_pane: { pane_id: "w1:p1" },
         });
       }
+      if (args[0] === "pane" && args[1] === "split") {
+        splitCount += 1;
+        return okJson({ pane: { pane_id: `w1:p${splitCount + 1}` } });
+      }
       if (args[0] === "agent" && args[1] === "prompt") {
+        const attempt = attempts[promptIndex++]!;
         writeFakeAgentResult({
-          resultPath,
+          resultPath: attempt.resultPath,
           runId: "run-1",
-          nodeId: "worker",
-          attemptId: "12345678-abcd",
+          nodeId: attempt.nodeId,
+          attemptId: attempt.attemptId,
           output: { ok: true },
         });
       }
@@ -715,23 +727,38 @@ test("spawn.closePaneAfterDone closes the pane after workflow_done", async () =>
   });
 
   try {
-    await executor.runAgentStep(
-      {
-        contract: baseContract(artifactDir, resultPath),
-        prompt: "do work",
-        spawn: {
-          name: "worker",
-          tools: "read",
-          fork: false,
-          closePaneAfterDone: true,
+    for (const [index, attempt] of attempts.entries()) {
+      await executor.runAgentStep(
+        {
+          contract: {
+            runId: "run-1",
+            workflowName: "review-flow",
+            ...attempt,
+          },
+          prompt: "do work",
+          spawn: {
+            name: attempt.nodeId,
+            tools: "read",
+            fork: false,
+            closePaneAfterDone: true,
+          },
+          accept: async (output) => ({ ok: true, value: output }),
         },
-        accept: async (output) => ({ ok: true, value: output }),
-      },
-      new AbortController().signal,
-    );
-    assert.ok(
-      calls.some((args) => args[0] === "pane" && args[1] === "close"),
-      `expected pane close in ${JSON.stringify(calls)}`,
+        new AbortController().signal,
+      );
+      if (index === 0) {
+        assert.equal(calls.some((args) => args[0] === "pane" && args[1] === "close"), false);
+      }
+    }
+
+    const splits = calls.filter((args) => args[0] === "pane" && args[1] === "split");
+    assert.deepEqual(splits.map((args) => args[2]), ["w1:p1", "w1:p1"]);
+    assert.deepEqual(
+      calls.filter((args) => args[0] === "pane" && args[1] === "close"),
+      [
+        ["pane", "close", "w1:p2"],
+        ["pane", "close", "w1:p3"],
+      ],
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
