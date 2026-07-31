@@ -23,7 +23,13 @@ import {
 export const DEFAULT_MAX_VALIDATION_ATTEMPTS = 3;
 
 export type HerdrAgentWaitProgress = {
-  phase: "agent_start" | "agent_prompt" | "blocked" | "validation_retry" | "result";
+  phase:
+    | "agent_start"
+    | "agent_prompt"
+    | "blocked"
+    | "completion_retry"
+    | "validation_retry"
+    | "result";
   paneId: string;
   agentName: string;
   nodeId: string;
@@ -63,9 +69,9 @@ export type HerdrStepExecutorOptions = {
   /** Max time for `agent prompt --wait`. Default 30m. Engine abort still wins. */
   completionTimeoutMs?: number;
   /**
-   * Max accepted `workflow_done` submissions for one agent step, including the
-   * first attempt. Validation failures re-prompt in the same live agent until
-   * this ceiling. Default 3.
+   * Max prompt/settle cycles for one agent step, including the first attempt.
+   * Covers both missing `workflow_done` and validator rejections. Each failure
+   * re-prompts the same live agent until this ceiling. Default 3.
    */
   maxValidationAttempts?: number;
   /** Progress hook for orchestrator tool updates. */
@@ -102,7 +108,8 @@ export type AgentStartContext = {
  *    and loading `pi-mcp-adapter` so the `mcp` tool exists)
  * 3. `herdr agent prompt ... --wait` blocks on a lifecycle signal
  * 4. read authoritative result.json written by workflow_done
- * 5. on validation rejection, clear result.json and re-prompt the same agent
+ * 5. if the agent settles with no result.json, re-prompt the same agent
+ * 6. on validation rejection, clear result.json and re-prompt the same agent
  */
 export class HerdrStepExecutor implements AgentStepExecutor {
   private readonly client: HerdrClient;
@@ -271,10 +278,16 @@ export class HerdrStepExecutor implements AgentStepExecutor {
       }
 
       let nextPrompt = prompt;
-      let lastValidationError: string | null = null;
+      let lastFailure: { kind: "missing_result" | "validation"; message: string } | null = null;
       for (let submission = 1; submission <= this.maxValidationAttempts; submission++) {
+        const retryPhase =
+          lastFailure?.kind === "missing_result"
+            ? "completion_retry"
+            : lastFailure?.kind === "validation"
+              ? "validation_retry"
+              : "agent_prompt";
         this.onProgress?.({
-          phase: submission === 1 ? "agent_prompt" : "validation_retry",
+          phase: submission === 1 ? "agent_prompt" : retryPhase,
           paneId,
           agentName,
           nodeId: contract.nodeId,
@@ -282,7 +295,9 @@ export class HerdrStepExecutor implements AgentStepExecutor {
           message:
             submission === 1
               ? `herdr agent prompt ${agentName} --wait`
-              : `validation rejected; re-prompt ${agentName} (${submission}/${this.maxValidationAttempts})`,
+              : lastFailure?.kind === "missing_result"
+                ? `missing workflow_done; re-prompt ${agentName} (${submission}/${this.maxValidationAttempts})`
+                : `validation rejected; re-prompt ${agentName} (${submission}/${this.maxValidationAttempts})`,
           submission,
           maxSubmissions: this.maxValidationAttempts,
         });
@@ -300,13 +315,23 @@ export class HerdrStepExecutor implements AgentStepExecutor {
         } catch (error) {
           throw this.mapAgentControlError(error, agentName, "prompt");
         }
-        await this.waitForWorkflowDone(
+        const hasResult = await this.waitForWorkflowDone(
           agentName,
           paneId,
           contract.resultPath,
           { nodeId: contract.nodeId, spawnName: spawn.name },
           signal,
         );
+        if (!hasResult) {
+          lastFailure = {
+            kind: "missing_result",
+            message: `Agent ${spawn.name} settled without calling workflow_done (${contract.resultPath})`,
+          };
+          if (submission >= this.maxValidationAttempts) break;
+          // Keep task.md as the original submitted task; retries only re-prompt live.
+          nextPrompt = buildMissingResultRetryPrompt(submission, this.maxValidationAttempts);
+          continue;
+        }
 
         const accepted = await this.acceptSubmission(request);
         if (accepted.ok) {
@@ -333,15 +358,20 @@ export class HerdrStepExecutor implements AgentStepExecutor {
           return { output: accepted.value };
         }
 
-        lastValidationError = accepted.error;
+        lastFailure = { kind: "validation", message: accepted.error };
         clearResultFile(contract.resultPath);
         if (submission >= this.maxValidationAttempts) break;
         // Keep task.md as the original submitted task; retries only re-prompt live.
         nextPrompt = buildValidationRetryPrompt(accepted.error, submission, this.maxValidationAttempts);
       }
 
+      if (lastFailure?.kind === "missing_result") {
+        throw new Error(
+          `${lastFailure.message} after ${this.maxValidationAttempts} submission(s)`,
+        );
+      }
       throw new Error(
-        `Agent output rejected after ${this.maxValidationAttempts} submission(s): ${lastValidationError}`,
+        `Agent output rejected after ${this.maxValidationAttempts} submission(s): ${lastFailure?.message ?? "unknown validation error"}`,
       );
     } finally {
       this.lastPaneId = closedPane ? this.rootPaneId : paneId;
@@ -351,15 +381,19 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     }
   }
 
-  /** `agent prompt --wait` is the lifecycle signal; result.json is authoritative. */
+  /**
+   * `agent prompt --wait` is the lifecycle signal; result.json is authoritative.
+   * Returns true when workflow_done wrote a result. Returns false when the agent
+   * settled without one so the caller can re-prompt within the attempt ceiling.
+   */
   private async waitForWorkflowDone(
     agentName: string,
     paneId: string,
     resultPath: string,
     meta: { nodeId: string; spawnName: string },
     signal: AbortSignal,
-  ): Promise<void> {
-    if (readResultFile(resultPath)) return;
+  ): Promise<boolean> {
+    if (readResultFile(resultPath)) return true;
 
     let agent;
     try {
@@ -387,12 +421,10 @@ export class HerdrStepExecutor implements AgentStepExecutor {
       } catch (error) {
         throw this.mapAgentControlError(error, agentName, "wait");
       }
-      if (readResultFile(resultPath)) return;
+      if (readResultFile(resultPath)) return true;
     }
 
-    throw new Error(
-      `Agent ${meta.spawnName} settled without calling workflow_done (${resultPath})`,
-    );
+    return false;
   }
 
   private async acceptSubmission(
@@ -632,6 +664,21 @@ function buildValidationRetryPrompt(
   ].join("\n");
 }
 
+function buildMissingResultRetryPrompt(
+  submission: number,
+  maxSubmissions: number,
+): string {
+  return [
+    "You settled without calling workflow_done.",
+    `Submission ${submission} of ${maxSubmissions}.`,
+    "",
+    "This step is incomplete until workflow_done accepts structured output.",
+    "Call workflow_done now with the best available result.",
+    "If evidence is incomplete, still submit: use status=\"inconclusive\" (or ok=false when that is the schema) and list evidenceGaps.",
+    "Do not keep investigating past this reminder unless one bounded probe is required to fill a required field.",
+  ].join("\n");
+}
+
 /**
  * Map workflow spawn.kind → Herdr `--kind`.
  * Herdr only accepts a fixed agent enum; `pi-wiz` is a pi wrapper with env bootstrap.
@@ -670,6 +717,9 @@ function defaultAgentArgs(ctx: AgentStartContext): string[] {
   // package source: npm:/git:/https://github.com/...). Package sources are
   // resolved by PackageManager.resolveExtensionSources({ temporary: true }).
   const args = ["--no-session", "-ne", "-e", ctx.childExtensionPath];
+  for (const extension of ctx.spawn.extensions ?? []) {
+    args.push("-e", extension);
+  }
   if (ctx.spawn.kind === "pi-wiz") {
     // Wiz MCP needs the mcp tool from pi-mcp-adapter.
     args.push("-e", PI_MCP_ADAPTER_SOURCE);

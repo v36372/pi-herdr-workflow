@@ -1,12 +1,12 @@
 import { spawn } from "node:child_process";
-import { cancelledError, timeoutError } from "./errors.js";
+import { CancelledError, TimeoutError } from "./errors.js";
 import type { ShellActionExecution, ShellActionResult } from "./types.js";
 
 /** Default cap on captured stdout/stderr, each. */
 const DEFAULT_MAX_OUTPUT_CHARS = 1_000_000;
 const TRUNCATION_MARKER = "\n…[output truncated]";
 
-const SHELL_RESULT = Symbol.for("pi-herdr-workflows.shell-result");
+const SHELL_RESULT = Symbol.for("pi-workflows.shell-result");
 
 /**
  * Retrieve the shell result attached to an error thrown by
@@ -33,10 +33,10 @@ function shellFailure(
   killedBy: "timeout" | "abort" | null,
 ): Error | undefined {
   if (killedBy === "timeout") {
-    return timeoutError(spec.timeoutMs ?? 0);
+    return new TimeoutError(spec.timeoutMs ?? 0);
   }
   if (killedBy === "abort") {
-    return cancelledError();
+    return new CancelledError();
   }
   if (((result.exitCode ?? 0) !== 0 || result.signal != null) && spec.allowNonZeroExit !== true) {
     const status = result.signal ? `signal ${result.signal}` : `exit ${String(result.exitCode)}`;
@@ -55,7 +55,7 @@ export async function runShellAction(
   // The node may have been cancelled while an async `exec` callback resolved;
   // never start side effects for an already-abandoned attempt.
   if (signal?.aborted) {
-    throw cancelledError();
+    throw new CancelledError();
   }
   const cwd = spec.cwd ?? process.cwd();
   const args = spec.args ?? [];

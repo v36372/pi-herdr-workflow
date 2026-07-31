@@ -32,16 +32,18 @@
   "files": [
     "src",
     "skills",
+    "docs",
+    "scripts",
     "README.md",
     "LICENSE",
     "examples"
   ],
   "scripts": {
+    "check:upstream": "bash scripts/check-upstream-workflows.sh",
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@effect/platform-node": "^4.0.0-beta.101",
     "effect": "^4.0.0-beta.101",
     "jiti": "^2.7.0"
   },

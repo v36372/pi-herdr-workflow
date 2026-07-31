@@ -28,11 +28,15 @@ agent({
     agent: "scout",            // load ~/.pi/agent/agents/scout.md defaults
     systemPrompt: "...",       // string or (ctx) => string
     model: "…",
+    thinking: "high",
     skills: "foo,bar",
     tools: "read,bash,grep",
+    extensions: ["/path/to/pi-ask/index.ts"], // explicit -e sources; settings stay disabled
     cwd: "./packages/api",     // string or (ctx) => string
+    kind: "pi",                // or "pi-wiz"
     fork: false,
     interactive: false,
+    closePaneAfterDone: true,
   },
   prompt: ({ input, outputs }) => `…`,
   expectedOutput: `{ "findings": [] }`,
@@ -51,6 +55,13 @@ prepended to the task when that field is omitted.
 executor uses Pi's `DefaultResourceLoader` for the child cwd, resolves each name,
 and prepends the same full `<skill ...>` blocks produced by `/skill:name` to the
 submitted task. An unknown agent or skill fails the node before Pi starts.
+
+`extensions` adds explicit Pi `-e` sources to the child. Workflow agents still run
+with settings discovery disabled, so interactive tools such as `ask`, observers
+such as a companion overlay, and extension-defined model providers must be listed
+when that node needs them. For example, a `grok-cli/grok-4.5` child needs the
+`pi-grok-cli` extension in `spawn.extensions`; selecting the model alone cannot
+register its provider under `-ne`.
 
 ## Orchestrator and completion model
 
@@ -77,6 +88,12 @@ Per agent attempt under `~/.pi/agent/workflows/runs/<runId>/agents/<nodeId>/<att
 | `agent-env.sh` | orchestrator | environment inherited by the interactive child |
 
 The child extension registers `workflow_done`, writes `result.json`, and returns a terminating tool result so pi settles. `herdr agent prompt --wait` then wakes the orchestrator. No exit-sidecar handshake or status polling is used.
+
+## Run bundles
+
+The workflow core tracks upstream `pi-workflows` v0.2.0. Every run writes a private `0700` bundle with an append-only trace, atomic state and manifest projections, a serializable workflow snapshot, and content-addressed artifacts for strings larger than 4096 bytes. Files are `0600`.
+
+The trace is the workflow replay source of truth. Herdr attempt files remain separate under `agents/<node>/<attempt>/` because they are the live child protocol, not deduplicated run data. Full Pi session-event replay is not exposed yet because child conversations occur in separate Herdr panes. See [`docs/upstream-sync.md`](docs/upstream-sync.md) for the pinned revision and sync boundary.
 
 ## Install
 
@@ -161,8 +178,8 @@ The deterministic `workflow` tool uses `HerdrClient` / `HerdrStepExecutor` and o
 ## Deliberate ceilings
 
 1. **Workflow-owned lifecycle** — agent frontmatter fields for subagent spawning, session mode, auto-exit, and interactivity do not apply. Workflow agents are fresh ephemeral Pi sessions and must finish through `workflow_done`.
-2. **Bounded validation retry** — if `validate` rejects after `workflow_done`, the same live agent is re-prompted with the validation error. Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
-3. **No graph widget / viewer** — run bundles still write to disk; use `state.json` / `trace.ndjson` or reattach a viewer later.
+2. **Bounded completion retry** — if the agent settles without `workflow_done`, or `validate` rejects after `workflow_done`, the same live agent is re-prompted (missing-result reminder or validation error). Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
+3. **No graph widget / temporal session viewer** — workflow replay bundles write to disk, but the upstream Pi recorder would not capture Herdr child sessions. Use `state.json` / `trace.ndjson`; add a Herdr-aware recorder before exposing temporal replay.
 4. **Agent kind** — workflow nodes currently start interactive pi agents. Override `buildAgentArgs` for pi arguments; supporting other agent kinds requires a compatible structured-result tool.
 5. **No `agent.view.*` / metadata-token integration** — Herdr 0.7.5 exposes `agent.view.set`/`agent.view.clear` only on the socket API (no CLI subcommand) and `pane`/`workspace report-metadata` as display-token writers that require host UI config (`$token` rows in `config.toml`). They do not improve workflow-run correctness or lifecycle waits, so this package intentionally does not wrap them or build a custom socket client for nominal coverage. Pane labels plus `workflow` tool progress remain the run-visibility surface.
 

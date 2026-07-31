@@ -9,16 +9,7 @@ export {
 } from "./definition.js";
 export { decision, decisionEdge, type DecisionDefinition } from "./decision.js";
 export { WorkflowEngine, appendStepContract } from "./engine.js";
-export {
-  CancelledError,
-  TimeoutError,
-  cancelledError,
-  errorMessage,
-  isAbortLikeError,
-  isCancelledError,
-  isTimeoutError,
-  timeoutError,
-} from "./errors.js";
+export { CancelledError, TimeoutError } from "./errors.js";
 export {
   extractJsonValue,
   parseJsonValue,
@@ -38,19 +29,25 @@ export {
 export { renderShellCommand, runShellAction } from "./shell.js";
 export { sanitizeText, stripAnsi } from "./text.js";
 export {
+  ARTIFACT_THRESHOLD_BYTES,
+  ArtifactWriter,
+  decodeValueWith,
+  encodeValue,
+  isArtifactValue,
+  resolveArtifacts,
+} from "./artifacts.js";
+export {
   DEFINITION_SNAPSHOT_SCHEMA,
   RUN_BUNDLE_SCHEMA,
+  RUN_STATE_SCHEMA,
+  SESSION_BINDING_SCHEMA,
   TRACE_EVENT_SCHEMA,
-  Service as WorkflowRunStoreService,
   WorkflowRunStore,
   createDefinitionSnapshot,
   createRunId,
-  layer as workflowRunStoreLayer,
   listRunBundles,
-  make as makeWorkflowRunStore,
   readRunBundle,
   workflowRunsBaseDir,
-  type Interface as WorkflowRunStoreInterface,
   type LoadedRunBundle,
 } from "./store.js";
 export type {
@@ -60,9 +57,11 @@ export type {
   AgentStepExecutor,
   AgentStepRequest,
   AgentStepSubmission,
-  WorkflowAgentKind,
   ActionNodeDefinition,
+  ArtifactRef,
+  ArtifactValue,
   CheckpointNodeDefinition,
+  ConversationRange,
   ComputeNodeDefinition,
   FunctionActionNodeDefinition,
   MaybePromise,
@@ -71,6 +70,7 @@ export type {
   ShellActionNodeDefinition,
   ShellActionResult,
   WorkflowActionReceipt,
+  WorkflowAgentKind,
   WorkflowDefinition,
   WorkflowDefinitionSnapshot,
   WorkflowEdge,
@@ -86,6 +86,8 @@ export type {
   WorkflowRunResult,
   WorkflowRunState,
   WorkflowRunStatus,
+  WorkflowSessionBinding,
+  WorkflowSessionEntryRecord,
   WorkflowStepRecord,
   WorkflowTraceEvent,
   WorkflowTraceEventDraft,

@@ -148,9 +148,11 @@ export default function (pi: ExtensionAPI) {
         const activity =
           event.phase === "blocked"
             ? "waiting for input"
-            : event.phase === "validation_retry"
-              ? "retrying invalid output"
-              : undefined;
+            : event.phase === "completion_retry"
+              ? "retrying missing workflow_done"
+              : event.phase === "validation_retry"
+                ? "retrying invalid output"
+                : undefined;
         publish({
           phase: "running",
           currentNodeId: event.nodeId,
