@@ -323,6 +323,7 @@ function snapshotNode(node: WorkflowNodeDefinition): WorkflowNodeSnapshot {
         ...(spawn.model !== undefined ? { model: spawn.model } : {}),
         ...(spawn.skills !== undefined ? { skills: spawn.skills } : {}),
         ...(spawn.tools !== undefined ? { tools: spawn.tools } : {}),
+        ...(spawn.extensions !== undefined ? { extensions: [...spawn.extensions] } : {}),
         ...(typeof spawn.cwd === "string" ? { cwd: spawn.cwd } : {}),
         ...(spawn.fork !== undefined ? { fork: spawn.fork } : {}),
         ...(spawn.interactive !== undefined ? { interactive: spawn.interactive } : {}),

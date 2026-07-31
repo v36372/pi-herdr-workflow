@@ -69,6 +69,7 @@ function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): 
   assertOptionalString(spawn.thinking, `node ${nodeId} spawn.thinking`);
   assertOptionalString(spawn.skills, `node ${nodeId} spawn.skills`);
   assertOptionalString(spawn.tools, `node ${nodeId} spawn.tools`);
+  assertOptionalStringArray(spawn.extensions, `node ${nodeId} spawn.extensions`);
   assertStringOrFn(spawn.cwd, `node ${nodeId} spawn.cwd`);
   if (spawn.kind !== undefined && spawn.kind !== "pi" && spawn.kind !== "pi-wiz") {
     fail(`node ${nodeId} spawn.kind must be "pi" or "pi-wiz"`);
@@ -81,6 +82,15 @@ function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): 
 function assertOptionalString(value: unknown, description: string): void {
   if (value !== undefined && typeof value !== "string") {
     fail(`${description} must be a string`);
+  }
+}
+
+function assertOptionalStringArray(value: unknown, description: string): void {
+  if (
+    value !== undefined &&
+    (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim() === ""))
+  ) {
+    fail(`${description} must be an array of non-empty strings`);
   }
 }
 

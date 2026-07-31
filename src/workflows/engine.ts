@@ -857,6 +857,7 @@ async function resolveAgentSpawn(
     ...(spawn.thinking !== undefined ? { thinking: spawn.thinking } : {}),
     ...(spawn.skills !== undefined ? { skills: spawn.skills } : {}),
     ...(spawn.tools !== undefined ? { tools: spawn.tools } : {}),
+    ...(spawn.extensions !== undefined ? { extensions: [...spawn.extensions] } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
     ...(spawn.kind !== undefined ? { kind: spawn.kind } : {}),
     fork: spawn.fork === true,

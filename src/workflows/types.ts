@@ -64,6 +64,8 @@ export type AgentSpawnParams = {
   skills?: string;
   /** Comma-separated native tool names. */
   tools?: string;
+  /** Pi extension sources loaded explicitly while settings discovery is disabled. */
+  extensions?: string[];
   /** Working directory for the agent process. */
   cwd?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
   /**
@@ -102,6 +104,7 @@ export type ResolvedAgentSpawn = {
   thinking?: string;
   skills?: string;
   tools?: string;
+  extensions?: string[];
   cwd?: string;
   kind?: WorkflowAgentKind;
   fork: boolean;
@@ -301,6 +304,7 @@ export type WorkflowNodeSnapshot = {
     model?: string;
     skills?: string;
     tools?: string;
+    extensions?: string[];
     cwd?: string;
     fork?: boolean;
     interactive?: boolean;
