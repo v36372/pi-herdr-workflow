@@ -76,6 +76,7 @@ test("executor starts and prompts pi through Herdr 0.7.5 agent facade", async ()
         spawn: {
           name: "Scout: Auth",
           tools: "read",
+          extensions: ["/tmp/pi-ask.ts", "/tmp/companion.ts"],
           fork: false,
         },
         accept: async (output) => ({ ok: true, value: output }),
@@ -99,6 +100,9 @@ test("executor starts and prompts pi through Herdr 0.7.5 agent facade", async ()
     assert.ok(start!.includes("--no-session"));
     assert.ok(start!.includes("-ne"));
     assert.equal(start![start!.indexOf("--tools") + 1], "read,workflow_done");
+    const extensionArgs = start!
+      .flatMap((value, index) => (value === "-e" ? [start![index + 1]] : []));
+    assert.deepEqual(extensionArgs.slice(-2), ["/tmp/pi-ask.ts", "/tmp/companion.ts"]);
 
     const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt");
     assert.ok(prompt);
@@ -302,6 +306,133 @@ test("executor re-prompts the same agent on validation failure and clears stale 
     );
     assert.equal(progress[2]?.submission, 2);
     assert.ok(readResultFile(resultPath));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executor re-prompts when the agent settles without workflow_done", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-missing-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  const promptCalls: string[] = [];
+  const progress: string[] = [];
+  let promptCount = 0;
+
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w-missing" },
+          root_pane: { pane_id: "w-missing:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        return okJson({ agent: { agent_status: "idle" } });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        promptCount += 1;
+        promptCalls.push(args[3]!);
+        // First settle has no result.json; second write succeeds.
+        if (promptCount >= 2) {
+          writeFakeAgentResult({
+            resultPath,
+            runId: "run-1",
+            nodeId: "review",
+            attemptId: "12345678-abcd",
+            output: { recovered: true },
+          });
+        }
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+    maxValidationAttempts: 3,
+    onProgress: (event) => progress.push(event.phase),
+  });
+
+  try {
+    const submission = await executor.runAgentStep(
+      {
+        contract: baseContract(artifactDir, resultPath),
+        prompt: "Return a report via workflow_done.",
+        spawn: { name: "Morning: K8s", tools: "read", fork: false },
+        accept: async (output) => ({ ok: true, value: output }),
+      },
+      new AbortController().signal,
+    );
+
+    assert.deepEqual(submission.output, { recovered: true });
+    assert.equal(promptCount, 2);
+    assert.equal(promptCalls[0], "Return a report via workflow_done.");
+    assert.match(promptCalls[1]!, /settled without calling workflow_done/);
+    assert.match(promptCalls[1]!, /Submission 1 of 3/);
+    assert.match(promptCalls[1]!, /status=\"inconclusive\"/);
+    assert.deepEqual(progress, [
+      "agent_start",
+      "agent_prompt",
+      "completion_retry",
+      "result",
+    ]);
+    assert.equal(
+      readFileSync(path.join(artifactDir, "task.md"), "utf8"),
+      "Return a report via workflow_done.",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executor fails after the missing workflow_done attempt ceiling", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "phw-missing-cap-"));
+  const artifactDir = path.join(root, "agents", "review", "12345678-abcd");
+  const resultPath = path.join(artifactDir, "result.json");
+  let promptCount = 0;
+  const client = new HerdrClient({
+    exec: async (args) => {
+      if (args[0] === "workspace" && args[1] === "create") {
+        return okJson({
+          workspace: { workspace_id: "w-missing-cap" },
+          root_pane: { pane_id: "w-missing-cap:p1" },
+        });
+      }
+      if (args[0] === "agent" && args[1] === "get") {
+        return okJson({ agent: { agent_status: "idle" } });
+      }
+      if (args[0] === "agent" && args[1] === "prompt") {
+        promptCount += 1;
+        // Never write result.json.
+      }
+      return okJson();
+    },
+  });
+  const executor = new HerdrStepExecutor({
+    originFocus: {},
+    client,
+    cwd: root,
+    maxValidationAttempts: 2,
+  });
+
+  try {
+    await assert.rejects(
+      () =>
+        executor.runAgentStep(
+          {
+            contract: baseContract(artifactDir, resultPath),
+            prompt: "Return a report via workflow_done.",
+            spawn: { name: "Morning: K8s", tools: "read", fork: false },
+            accept: async (output) => ({ ok: true, value: output }),
+          },
+          new AbortController().signal,
+        ),
+      /settled without calling workflow_done .* after 2 submission\(s\)/,
+    );
+    assert.equal(promptCount, 2);
+    assert.equal(existsSync(resultPath), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

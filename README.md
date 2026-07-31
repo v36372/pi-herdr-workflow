@@ -30,6 +30,7 @@ agent({
     model: "…",
     skills: "foo,bar",
     tools: "read,bash,grep",
+    extensions: ["/path/to/pi-ask/index.ts"], // explicit -e sources; settings stay disabled
     cwd: "./packages/api",     // string or (ctx) => string
     fork: false,
     interactive: false,
@@ -51,6 +52,10 @@ prepended to the task when that field is omitted.
 executor uses Pi's `DefaultResourceLoader` for the child cwd, resolves each name,
 and prepends the same full `<skill ...>` blocks produced by `/skill:name` to the
 submitted task. An unknown agent or skill fails the node before Pi starts.
+
+`extensions` adds explicit Pi `-e` sources to the child. Workflow agents still run
+with settings discovery disabled, so interactive tools such as `ask` and observers
+such as a companion overlay must be listed when that node needs them.
 
 ## Orchestrator and completion model
 
@@ -161,7 +166,7 @@ The deterministic `workflow` tool uses `HerdrClient` / `HerdrStepExecutor` and o
 ## Deliberate ceilings
 
 1. **Workflow-owned lifecycle** — agent frontmatter fields for subagent spawning, session mode, auto-exit, and interactivity do not apply. Workflow agents are fresh ephemeral Pi sessions and must finish through `workflow_done`.
-2. **Bounded validation retry** — if `validate` rejects after `workflow_done`, the same live agent is re-prompted with the validation error. Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
+2. **Bounded completion retry** — if the agent settles without `workflow_done`, or `validate` rejects after `workflow_done`, the same live agent is re-prompted (missing-result reminder or validation error). Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
 3. **No graph widget / viewer** — run bundles still write to disk; use `state.json` / `trace.ndjson` or reattach a viewer later.
 4. **Agent kind** — workflow nodes currently start interactive pi agents. Override `buildAgentArgs` for pi arguments; supporting other agent kinds requires a compatible structured-result tool.
 5. **No `agent.view.*` / metadata-token integration** — Herdr 0.7.5 exposes `agent.view.set`/`agent.view.clear` only on the socket API (no CLI subcommand) and `pane`/`workspace report-metadata` as display-token writers that require host UI config (`$token` rows in `config.toml`). They do not improve workflow-run correctness or lifecycle waits, so this package intentionally does not wrap them or build a custom socket client for nominal coverage. Pane labels plus `workflow` tool progress remain the run-visibility surface.
