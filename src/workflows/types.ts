@@ -44,58 +44,26 @@ export type WorkflowEdge =
       };
     };
 
-/**
- * Subagent-style launch params for an agent node. Same surface as
- * interactive-subagents `subagent()` (minus dispatch/mux tools). Resolved by
- * the engine, executed by the configured AgentStepExecutor (Herdr panes).
- */
+/** Author-authored launch configuration for a Herdr agent node. */
 export type AgentSpawnParams = {
-  /** Display name / pane label. Defaults to the node id. */
   name?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
-  /** Agent definition name. Loads project `.pi/agents/<name>.md`, then global defaults. */
   agent?: string;
-  /** Appended (or replaces, via agent frontmatter) system prompt. */
   systemPrompt?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
-  /** Model override. */
   model?: string;
-  /** Thinking level override (e.g. `low`, `medium`, `high`). */
   thinking?: string;
-  /** Comma-separated skill names eagerly expanded into the child task. */
   skills?: string;
-  /** Comma-separated native tool names. */
   tools?: string;
-  /** Pi extension sources loaded explicitly while settings discovery is disabled. */
   extensions?: string[];
-  /** Working directory for the agent process. */
   cwd?: string | ((context: WorkflowNodeContext) => MaybePromise<string>);
-  /**
-   * Workflow launch kind. Defaults to `pi`.
-   *
-   * - `pi` — standard pi child (Herdr `--kind pi`)
-   * - `pi-wiz` — pi + local Wiz MCP env bootstrap (`~/.config/wiz-mcp/env.zsh`)
-   *   and `pi -e https://github.com/nicobailon/pi-mcp-adapter` (MCP is not
-   *   built into pi; `-e` accepts package sources, not only file paths).
-   *   Still starts as Herdr kind `pi`; env is injected via `agent-env.sh`.
-   */
   kind?: WorkflowAgentKind;
-  /** Force full-context fork of the orchestrator session into the child. */
   fork?: boolean;
-  /**
-   * Interactive child: user may drive the pane; orchestrator does not treat
-   * long waits as stalls. Defaults depend on executor/agent frontmatter.
-   */
   interactive?: boolean;
-  /**
-   * When true, close the agent pane after a successful `workflow_done`.
-   * Default false so collaborative agents can keep working in the open pane.
-   */
   closePaneAfterDone?: boolean;
 };
 
-/** Workflow-level agent launch kinds (not the full Herdr kind enum). */
 export type WorkflowAgentKind = "pi" | "pi-wiz";
 
-/** Spawn params after context callbacks have been resolved. */
+/** Concrete launch configuration after context callbacks resolve. */
 export type ResolvedAgentSpawn = {
   name: string;
   agent?: string;
@@ -108,24 +76,16 @@ export type ResolvedAgentSpawn = {
   cwd?: string;
   kind?: WorkflowAgentKind;
   fork: boolean;
-  /** Close the Herdr pane after successful workflow_done. Default false. */
-  closePaneAfterDone?: boolean;
   interactive?: boolean;
+  closePaneAfterDone?: boolean;
 };
 
-/**
- * A model-shaped step. The engine builds a prompt and delegates to the
- * AgentStepExecutor. Default Herdr executor runs each agent in its own pane
- * and collects structured output from a result file (workflow_done tool).
- * `validate` may reject (throw) or normalize the submitted output; rejections
- * are surfaced to the model so it can retry within the same step.
- */
+/** A model-shaped step dispatched through the configured agent executor. */
 export type AgentNodeDefinition = WorkflowNodeCommon & {
   nodeType: "agent";
   prompt: (context: WorkflowNodeContext) => MaybePromise<string>;
   expectedOutput?: string;
   validate?: (output: unknown, context: WorkflowNodeContext) => MaybePromise<unknown>;
-  /** Subagent-style launch params. Omitted fields use executor defaults. */
   spawn?: AgentSpawnParams;
 };
 
@@ -223,6 +183,34 @@ export type WorkflowDefinition = {
 
 export type WorkflowNodeOutcome = "ok" | "timed_out" | "failed" | "cancelled";
 
+/**
+ * Reference to a content-addressed file under the bundle's `artifacts/`
+ * directory. Large string leaves inside persisted values are replaced by
+ * `{ "$artifact": ArtifactRef }` at write time (see `docs/run-bundles.md`).
+ */
+export type ArtifactRef = {
+  /** Bundle-relative path, `artifacts/sha256-<64 hex>.txt`. */
+  path: string;
+  mediaType: string;
+  bytes: number;
+  /** Hex digest of the artifact bytes. */
+  sha256: string;
+};
+
+/** The sentinel wrapper that replaces an externalized value. */
+export type ArtifactValue = { $artifact: ArtifactRef };
+
+/**
+ * Explicit linkage from a workflow attempt to the Pi conversation slice it
+ * produced. Ids address entries in `session/entries.ndjson` by Pi entry id.
+ */
+export type ConversationRange = {
+  /** First Pi session entry id of the attempt. */
+  firstEntryId: string;
+  /** Last Pi session entry id of the attempt, inclusive. */
+  lastEntryId: string;
+};
+
 export type WorkflowNodeResult = {
   attemptId: string;
   nodeId: string;
@@ -252,10 +240,16 @@ export type WorkflowStepRecord = {
   outcome: WorkflowNodeOutcome;
   startedAt: string;
   finishedAt: string;
-  promptText: string | null;
+  /**
+   * Full prompt text for agent steps, `null` for other node types. In a
+   * persisted bundle a large prompt may be an `ArtifactValue`.
+   */
+  prompt: string | ArtifactValue | null;
   output: unknown;
   error?: string;
   action?: WorkflowActionReceipt;
+  /** For agent steps recorded inside a Pi conversation. */
+  conversation?: ConversationRange;
 };
 
 export type WorkflowRunStatus =
@@ -267,6 +261,13 @@ export type WorkflowRunStatus =
   | "cancelled";
 
 export type WorkflowRunState = {
+  schema: "pi-workflows.run-state.v1";
+  /**
+   * `seq` of the trace event this projection reflects. `trace.ndjson` is the
+   * source of truth; a state whose `traceSeq` is older than the trace tail is
+   * a stale projection.
+   */
+  traceSeq: number;
   runId: string;
   workflowName: string;
   runTitle?: string;
@@ -281,7 +282,6 @@ export type WorkflowRunState = {
   steps: WorkflowStepRecord[];
   currentNode?: string;
   currentAttemptId?: string;
-  currentNodeType?: WorkflowNodeDefinition["nodeType"];
   currentNodeStartedAt?: string;
   statusDetail?: string;
   /** True while the run is held at a step boundary by a pause request. */
@@ -301,18 +301,22 @@ export type WorkflowNodeSnapshot = {
   spawn?: {
     name?: string;
     agent?: string;
+    systemPrompt?: string;
     model?: string;
+    thinking?: string;
     skills?: string;
     tools?: string;
     extensions?: string[];
     cwd?: string;
+    kind?: WorkflowAgentKind;
     fork?: boolean;
     interactive?: boolean;
+    closePaneAfterDone?: boolean;
   };
 };
 
 export type WorkflowDefinitionSnapshot = {
-  schema: "pi-herdr-workflows.definition-snapshot.v1";
+  schema: "pi-workflows.definition-snapshot.v1";
   name: string;
   startAt: string;
   nodes: Record<string, WorkflowNodeSnapshot>;
@@ -322,7 +326,7 @@ export type WorkflowDefinitionSnapshot = {
 export type WorkflowTraceEvent = {
   seq: number;
   at: string;
-  scope: "run" | "node" | "agent" | "action";
+  scope: "run" | "node" | "agent" | "action" | "session";
   type: string;
   runId: string;
   nodeId?: string;
@@ -330,10 +334,81 @@ export type WorkflowTraceEvent = {
   payload: Record<string, unknown>;
 };
 
+/** `session/binding.json`: written once when a run binds to a conversation. */
+export type WorkflowSessionBinding = {
+  schema: "pi-workflows.session-binding.v1";
+  runId: string;
+  /** Pi session UUID. */
+  piSessionId: string;
+  /**
+   * Absolute path of the Pi session file; provenance only, never read back.
+   * Absent for in-memory sessions.
+   */
+  piSessionFile?: string;
+  /** Working directory of the conversation. */
+  cwd: string;
+  boundAt: string;
+};
+
+/**
+ * One line of `session/entries.ndjson`: a verbatim Pi session entry recorded
+ * while the run was active. The inner entry shape is owned by Pi.
+ */
+export type WorkflowSessionEntryRecord = {
+  /** Starts at 1, increases by exactly 1 within the file. */
+  seq: number;
+  /** When the entry was recorded into the bundle. */
+  at: string;
+  /** Verbatim Pi session entry (has its own id/parentId/timestamp). */
+  entry: Record<string, unknown>;
+};
+
+export type WorkflowSessionEventType =
+  | "turn_started"
+  | "turn_finished"
+  | "message_started"
+  | "assistant_event"
+  | "message_finished"
+  | "tool_execution_started"
+  | "tool_execution_updated"
+  | "tool_execution_finished";
+
+/** One normalized temporal Pi event in `session/events.ndjson`. */
+export type WorkflowSessionEventRecord = {
+  /** Starts at 1 and increases by exactly 1 within the file. */
+  seq: number;
+  /** Time when the extension received the public Pi event. */
+  at: string;
+  nodeId: string;
+  attemptId: string;
+  turnId?: string;
+  messageId?: string;
+  toolCallId?: string;
+  type: WorkflowSessionEventType;
+  payload: Record<string, unknown>;
+};
+
+export type WorkflowSessionCaptureFailure = {
+  failedAt: string;
+  code: string;
+  message: string;
+};
+
+/** Atomic integrity projection for the temporal session journal. */
+export type WorkflowSessionCapture = {
+  schema: "pi-workflows.session-capture.v1";
+  eventSchema: "pi-workflows.session-event.v1";
+  status: "recording" | "complete" | "failed";
+  eventCount: number;
+  entryCount: number;
+  lastEventSeq: number;
+  failure?: WorkflowSessionCaptureFailure;
+};
+
 export type WorkflowTraceEventDraft = Omit<WorkflowTraceEvent, "seq" | "at" | "runId">;
 
 export type WorkflowRunManifest = {
-  schema: "pi-herdr-workflows.run-bundle.v1";
+  schema: "pi-workflows.run-bundle.v1";
   runId: string;
   workflowName: string;
   runTitle?: string;
@@ -341,11 +416,15 @@ export type WorkflowRunManifest = {
   startedAt: string;
   finishedAt?: string;
   status: WorkflowRunStatus;
-  traceSchema: "pi-herdr-workflows.trace-event.v1";
+  traceSchema: "pi-workflows.trace-event.v1";
   paths: {
     workflow: string;
     state: string;
     trace: string;
+    /** Bundle-relative session directory, present once a session is bound. */
+    session?: string;
+    /** Bundle-relative artifacts directory, present once a value was externalized. */
+    artifacts?: string;
   };
 };
 
@@ -361,9 +440,9 @@ export type AgentStepContract = {
   nodeId: string;
   attemptId: string;
   expectedOutput?: string;
-  /** Absolute path the child must write accepted structured output to. */
+  /** Absolute path the child writes through `workflow_done`. */
   resultPath: string;
-  /** Artifact directory for this attempt (task, agent-env, result). */
+  /** Per-attempt directory for task, environment, and result files. */
   artifactDir: string;
 };
 
@@ -380,6 +459,11 @@ export type AgentStepRequest = {
 
 export type AgentStepSubmission = {
   output: unknown;
+  /**
+   * The Pi conversation slice this step produced, when the executor records
+   * one. Persisted verbatim into the step record and terminal node event.
+   */
+  conversation?: ConversationRange;
 };
 
 /**
@@ -395,6 +479,24 @@ export type WorkflowEngineOptions = {
   executor: AgentStepExecutor;
   /** Root directory for run bundles. Defaults to `~/.pi/agent/workflows/runs`. */
   outputRoot?: string;
+  /**
+   * Shared run store. Pass the same instance used by a session recorder so
+   * trace sequence numbers stay single-writer. Defaults to a new store on
+   * `outputRoot`.
+   */
+  store?: import("./store.js").WorkflowRunStore;
+  /**
+   * Awaited after `run_started` is persisted, before any node executes. This
+   * is where a session recorder binds, so `session_bound` lands at the start
+   * of the trace and can never trail the terminal event.
+   */
+  onRunStarted?: (runDir: string, state: WorkflowRunState) => MaybePromise<void>;
+  /**
+   * Awaited before the terminal snapshot is persisted. This is where a
+   * session recorder stops and drains, so the bundle is immutable the moment
+   * the terminal event exists. Errors are swallowed: finishing the run wins.
+   */
+  onRunFinishing?: (runDir: string, state: WorkflowRunState) => MaybePromise<void>;
   /** Default per-node timeout. Defaults to 15 minutes. */
   defaultNodeTimeoutMs?: number;
   /** Guard against unbounded graph loops. Defaults to 100 executed steps. */

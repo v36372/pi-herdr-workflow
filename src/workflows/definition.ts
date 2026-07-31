@@ -16,7 +16,7 @@ import type {
   WorkflowDefinition,
 } from "./types.js";
 
-const WORKFLOW_DEFINITION_BRAND = Symbol.for("pi-herdr-workflows.definition");
+const WORKFLOW_DEFINITION_BRAND = Symbol.for("pi-workflows.definition");
 
 export function defineWorkflow<TWorkflow extends WorkflowDefinition>(
   definition: TWorkflow,

@@ -31,54 +31,6 @@ function assertOptionalFunction(value: unknown, description: string): void {
   }
 }
 
-function assertCommonNodeFields(node: WorkflowNodeDefinition, nodeId: string): void {
-  if (
-    node.timeoutMs !== undefined &&
-    (typeof node.timeoutMs !== "number" || !Number.isFinite(node.timeoutMs) || node.timeoutMs <= 0)
-  ) {
-    fail(`node ${nodeId} timeoutMs must be a finite positive number`);
-  }
-  if (node.statusDetail !== undefined && typeof node.statusDetail !== "string") {
-    fail(`node ${nodeId} statusDetail must be a string`);
-  }
-}
-
-export function assertValidAgentNode(node: AgentNodeDefinition, nodeId = "agent"): void {
-  if (typeof node.prompt !== "function") {
-    fail(`node ${nodeId} requires a prompt function`);
-  }
-  if (node.expectedOutput !== undefined && typeof node.expectedOutput !== "string") {
-    fail(`node ${nodeId} expectedOutput must be a string`);
-  }
-  assertOptionalFunction(node.validate, `node ${nodeId} validate`);
-  assertCommonNodeFields(node, nodeId);
-  assertValidSpawn(node.spawn, nodeId);
-}
-
-function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): void {
-  if (spawn === undefined) {
-    return;
-  }
-  if (spawn == null || typeof spawn !== "object" || Array.isArray(spawn)) {
-    fail(`node ${nodeId} spawn must be an object`);
-  }
-  assertStringOrFn(spawn.name, `node ${nodeId} spawn.name`);
-  assertOptionalString(spawn.agent, `node ${nodeId} spawn.agent`);
-  assertStringOrFn(spawn.systemPrompt, `node ${nodeId} spawn.systemPrompt`);
-  assertOptionalString(spawn.model, `node ${nodeId} spawn.model`);
-  assertOptionalString(spawn.thinking, `node ${nodeId} spawn.thinking`);
-  assertOptionalString(spawn.skills, `node ${nodeId} spawn.skills`);
-  assertOptionalString(spawn.tools, `node ${nodeId} spawn.tools`);
-  assertOptionalStringArray(spawn.extensions, `node ${nodeId} spawn.extensions`);
-  assertStringOrFn(spawn.cwd, `node ${nodeId} spawn.cwd`);
-  if (spawn.kind !== undefined && spawn.kind !== "pi" && spawn.kind !== "pi-wiz") {
-    fail(`node ${nodeId} spawn.kind must be "pi" or "pi-wiz"`);
-  }
-  assertOptionalBoolean(spawn.fork, `node ${nodeId} spawn.fork`);
-  assertOptionalBoolean(spawn.interactive, `node ${nodeId} spawn.interactive`);
-  assertOptionalBoolean(spawn.closePaneAfterDone, `node ${nodeId} spawn.closePaneAfterDone`);
-}
-
 function assertOptionalString(value: unknown, description: string): void {
   if (value !== undefined && typeof value !== "string") {
     fail(`${description} must be a string`);
@@ -100,10 +52,56 @@ function assertOptionalBoolean(value: unknown, description: string): void {
   }
 }
 
-function assertStringOrFn(value: unknown, description: string): void {
+function assertStringOrFunction(value: unknown, description: string): void {
   if (value !== undefined && typeof value !== "string" && typeof value !== "function") {
     fail(`${description} must be a string or function`);
   }
+}
+
+function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): void {
+  if (spawn === undefined) return;
+  if (spawn === null || typeof spawn !== "object" || Array.isArray(spawn)) {
+    fail(`node ${nodeId} spawn must be an object`);
+  }
+  assertStringOrFunction(spawn.name, `node ${nodeId} spawn.name`);
+  assertOptionalString(spawn.agent, `node ${nodeId} spawn.agent`);
+  assertStringOrFunction(spawn.systemPrompt, `node ${nodeId} spawn.systemPrompt`);
+  assertOptionalString(spawn.model, `node ${nodeId} spawn.model`);
+  assertOptionalString(spawn.thinking, `node ${nodeId} spawn.thinking`);
+  assertOptionalString(spawn.skills, `node ${nodeId} spawn.skills`);
+  assertOptionalString(spawn.tools, `node ${nodeId} spawn.tools`);
+  assertOptionalStringArray(spawn.extensions, `node ${nodeId} spawn.extensions`);
+  assertStringOrFunction(spawn.cwd, `node ${nodeId} spawn.cwd`);
+  if (spawn.kind !== undefined && spawn.kind !== "pi" && spawn.kind !== "pi-wiz") {
+    fail(`node ${nodeId} spawn.kind must be "pi" or "pi-wiz"`);
+  }
+  assertOptionalBoolean(spawn.fork, `node ${nodeId} spawn.fork`);
+  assertOptionalBoolean(spawn.interactive, `node ${nodeId} spawn.interactive`);
+  assertOptionalBoolean(spawn.closePaneAfterDone, `node ${nodeId} spawn.closePaneAfterDone`);
+}
+
+function assertCommonNodeFields(node: WorkflowNodeDefinition, nodeId: string): void {
+  if (
+    node.timeoutMs !== undefined &&
+    (typeof node.timeoutMs !== "number" || !Number.isFinite(node.timeoutMs) || node.timeoutMs <= 0)
+  ) {
+    fail(`node ${nodeId} timeoutMs must be a finite positive number`);
+  }
+  if (node.statusDetail !== undefined && typeof node.statusDetail !== "string") {
+    fail(`node ${nodeId} statusDetail must be a string`);
+  }
+}
+
+export function assertValidAgentNode(node: AgentNodeDefinition, nodeId = "agent"): void {
+  if (typeof node.prompt !== "function") {
+    fail(`node ${nodeId} requires a prompt function`);
+  }
+  if (node.expectedOutput !== undefined && typeof node.expectedOutput !== "string") {
+    fail(`node ${nodeId} expectedOutput must be a string`);
+  }
+  assertOptionalFunction(node.validate, `node ${nodeId} validate`);
+  assertValidSpawn(node.spawn, nodeId);
+  assertCommonNodeFields(node, nodeId);
 }
 
 export function assertValidComputeNode(node: ComputeNodeDefinition, nodeId = "compute"): void {

@@ -40,9 +40,7 @@ export function workflowFileStem(filePath: string): string {
   return suffix ? base.slice(0, -suffix.length) : base;
 }
 
-// Alias the package name to this module's own entry so workflow files can
-// `import { agent } from "pi-herdr-workflows"` whether the engine runs from src
-// (tests, tsx) or from the built dist inside the installed package.
+// Resolve authored workflows against this package in source and installed runs.
 const SELF_ENTRY = path.join(path.dirname(fileURLToPath(import.meta.url)), "index");
 
 /** Load a workflow module from disk. The default export must be `defineWorkflow(...)`. */

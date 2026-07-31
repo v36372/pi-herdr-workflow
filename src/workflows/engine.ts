@@ -1,24 +1,17 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { Deferred, Effect } from "effect";
-import {
-  CancelledError,
-  cancelledError,
-  errorMessage,
-  isAbortLikeError,
-  isTimeoutError,
-  timeoutError,
-} from "./errors.js";
+import { CancelledError, errorMessage, isAbortLikeError, TimeoutError } from "./errors.js";
 import { resolveNext, resolveNextForOutcome, validateWorkflowDefinition } from "./graph.js";
 import { extractJsonValue } from "./json.js";
 import { runShellAction, shellResultFromError } from "./shell.js";
-import { WorkflowRunStore, createRunId } from "./store.js";
+import { RUN_STATE_SCHEMA, WorkflowRunStore, createRunId } from "./store.js";
 import type {
   AgentNodeDefinition,
   AgentStepExecutor,
   ActionNodeDefinition,
   CheckpointNodeDefinition,
+  ConversationRange,
   ResolvedAgentSpawn,
   ShellActionNodeDefinition,
   ShellActionResult,
@@ -45,6 +38,7 @@ type NodeExecution = {
   output: unknown;
   promptText: string | null;
   action?: WorkflowActionReceipt;
+  conversation?: ConversationRange;
 };
 
 /**
@@ -74,19 +68,21 @@ export class WorkflowEngine {
   private readonly defaultNodeTimeoutMs: number;
   private readonly maxSteps: number;
   private readonly onEvent?: WorkflowEngineOptions["onEvent"];
+  private readonly onRunStarted?: WorkflowEngineOptions["onRunStarted"];
+  private readonly onRunFinishing?: WorkflowEngineOptions["onRunFinishing"];
   private activeAbort: AbortController | null = null;
   private cancelled = false;
   private paused = false;
-  /** Effect pause gate: waiting fibers await this Deferred; resume/cancel complete it. */
-  private pauseGate: Deferred.Deferred<void> | null = null;
   private wakePause: (() => void) | null = null;
 
   constructor(options: WorkflowEngineOptions) {
     this.executor = options.executor;
-    this.store = new WorkflowRunStore(options.outputRoot);
+    this.store = options.store ?? new WorkflowRunStore(options.outputRoot);
     this.defaultNodeTimeoutMs = options.defaultNodeTimeoutMs ?? DEFAULT_NODE_TIMEOUT_MS;
     this.maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
     this.onEvent = options.onEvent;
+    this.onRunStarted = options.onRunStarted;
+    this.onRunFinishing = options.onRunFinishing;
   }
 
   get outputRoot(): string {
@@ -96,13 +92,10 @@ export class WorkflowEngine {
   /** Abort the currently running node and mark the run cancelled. */
   cancel(): void {
     this.cancelled = true;
-    this.activeAbort?.abort(cancelledError());
+    this.activeAbort?.abort(new CancelledError());
     // A run held at a pause boundary has no active node to abort; wake it so
     // it can observe the cancellation.
     this.wakePause?.();
-    if (this.pauseGate) {
-      Effect.runFork(Deferred.succeed(this.pauseGate, undefined));
-    }
   }
 
   /**
@@ -117,29 +110,11 @@ export class WorkflowEngine {
   resume(): void {
     this.paused = false;
     this.wakePause?.();
-    if (this.pauseGate) {
-      Effect.runFork(Deferred.succeed(this.pauseGate, undefined));
-    }
   }
 
   /** True when a pause has been requested or the run is already held. */
   get pauseRequested(): boolean {
     return this.paused;
-  }
-
-  /**
-   * Effect form of {@link run}. Composition roots may provide this into larger
-   * Effect programs; the Promise facade is a thin `Effect.runPromise` wrapper.
-   */
-  runEffect(
-    workflow: WorkflowDefinition,
-    input: unknown,
-    options: { workflowPath?: string } = {},
-  ): Effect.Effect<WorkflowRunResult, Error> {
-    return Effect.tryPromise({
-      try: () => this.run(workflow, input, options),
-      catch: (cause) => (cause instanceof Error ? cause : new Error(String(cause))),
-    });
   }
 
   async run(
@@ -154,7 +129,6 @@ export class WorkflowEngine {
     assertJsonSerializable(normalizedInput, "Workflow run input");
     this.cancelled = false;
     this.paused = false;
-    this.pauseGate = null;
 
     const state = await this.createRunState(workflow, normalizedInput, options.workflowPath);
     const runDir = await this.store.initializeRunBundle(workflow, state);
@@ -164,8 +138,13 @@ export class WorkflowEngine {
       payload: {
         workflowName: workflow.name,
         ...(state.runTitle ? { runTitle: state.runTitle } : {}),
+        input: state.input,
       },
     });
+    // Awaited so anything the hook writes (e.g. a session binding and its
+    // `session_bound` event) lands before node events and can never trail
+    // the terminal event of a fast run.
+    await this.onRunStarted?.(runDir, state);
 
     try {
       await this.executeGraph(workflow, state, runDir);
@@ -194,7 +173,7 @@ export class WorkflowEngine {
     const abort = new AbortController();
     this.activeAbort = abort;
     const timer = setTimeout(
-      () => abort.abort(timeoutError(TITLE_TIMEOUT_MS)),
+      () => abort.abort(new TimeoutError(TITLE_TIMEOUT_MS)),
       TITLE_TIMEOUT_MS,
     );
     try {
@@ -212,6 +191,8 @@ export class WorkflowEngine {
   ): Promise<WorkflowRunState> {
     const now = new Date().toISOString();
     return {
+      schema: RUN_STATE_SCHEMA,
+      traceSeq: 0,
       runId: createRunId(workflow.name),
       workflowName: workflow.name,
       ...(await this.resolveTitleBounded(workflow, input)),
@@ -252,6 +233,8 @@ export class WorkflowEngine {
 
       const attempt = await this.executeNode(workflow, state, runDir, currentNodeId, node);
       this.recordAttempt(state, attempt);
+      // The terminal node event carries the output, receipt, and conversation
+      // linkage so the trace alone is sufficient to reconstruct the run.
       await this.persist(runDir, state, {
         scope: "node",
         type: attempt.result.outcome === "ok" ? "node_finished" : "node_failed",
@@ -260,7 +243,12 @@ export class WorkflowEngine {
         payload: {
           outcome: attempt.result.outcome,
           durationMs: attempt.result.durationMs,
+          ...(attempt.result.outcome === "ok" ? { output: attempt.result.output ?? null } : {}),
           ...(attempt.result.error !== undefined ? { error: attempt.result.error } : {}),
+          ...(attempt.execution?.action !== undefined ? { action: attempt.execution.action } : {}),
+          ...(attempt.execution?.conversation !== undefined
+            ? { conversation: attempt.execution.conversation }
+            : {}),
         },
       });
 
@@ -294,7 +282,7 @@ export class WorkflowEngine {
    */
   private async holdWhilePaused(state: WorkflowRunState, runDir: string): Promise<void> {
     if (this.cancelled) {
-      throw cancelledError();
+      throw new CancelledError();
     }
     if (!this.paused) {
       return;
@@ -302,22 +290,14 @@ export class WorkflowEngine {
     state.paused = true;
     await this.persist(runDir, state, { scope: "run", type: "run_paused", payload: {} });
     while (this.paused && !this.cancelled) {
-      // Deferred is the Effect-native pause gate; keep the Promise wake path so
-      // cancel/resume from outside an Effect program still unblocks the loop.
-      const gate = Effect.runSync(Deferred.make<void>());
-      this.pauseGate = gate;
-      await Promise.race([
-        Effect.runPromise(Deferred.await(gate)),
-        new Promise<void>((resolve) => {
-          this.wakePause = resolve;
-        }),
-      ]);
-      this.wakePause = null;
-      this.pauseGate = null;
+      await new Promise<void>((resolve) => {
+        this.wakePause = resolve;
+      });
     }
+    this.wakePause = null;
     delete state.paused;
     if (this.cancelled) {
-      throw cancelledError();
+      throw new CancelledError();
     }
     await this.persist(runDir, state, { scope: "run", type: "run_resumed", payload: {} });
   }
@@ -332,7 +312,7 @@ export class WorkflowEngine {
       return next;
     }
     if (attempt.result.outcome === "cancelled" || this.cancelled) {
-      throw cancelledError();
+      throw new CancelledError();
     }
     if (attempt.result.outcome === "timed_out") {
       state.status = "timed_out";
@@ -358,16 +338,18 @@ export class WorkflowEngine {
       outcome: attempt.result.outcome,
       startedAt: attempt.result.startedAt,
       finishedAt: attempt.result.finishedAt,
-      promptText: attempt.execution?.promptText ?? null,
+      prompt: attempt.execution?.promptText ?? null,
       // `undefined` would drop the required field during JSON serialization.
       output: attempt.result.output ?? null,
       ...(attempt.result.error !== undefined ? { error: attempt.result.error } : {}),
       ...(attempt.execution?.action !== undefined ? { action: attempt.execution.action } : {}),
+      ...(attempt.execution?.conversation !== undefined
+        ? { conversation: attempt.execution.conversation }
+        : {}),
     };
     state.steps.push(step);
     delete state.currentNode;
     delete state.currentAttemptId;
-    delete state.currentNodeType;
     delete state.currentNodeStartedAt;
     delete state.statusDetail;
   }
@@ -383,7 +365,6 @@ export class WorkflowEngine {
     const startedAt = new Date().toISOString();
     state.currentNode = nodeId;
     state.currentAttemptId = attemptId;
-    state.currentNodeType = node.nodeType;
     state.currentNodeStartedAt = startedAt;
     if (node.statusDetail !== undefined) {
       state.statusDetail = node.statusDetail;
@@ -431,7 +412,7 @@ export class WorkflowEngine {
   }
 
   private outcomeForError(error: unknown): WorkflowNodeOutcome {
-    if (isTimeoutError(error)) {
+    if (error instanceof TimeoutError) {
       return "timed_out";
     }
     if (this.cancelled || isAbortLikeError(error)) {
@@ -474,11 +455,11 @@ export class WorkflowEngine {
     const abort = new AbortController();
     this.activeAbort = abort;
     if (this.cancelled) {
-      throw cancelledError();
+      throw new CancelledError();
     }
 
     const timer = setTimeout(() => {
-      abort.abort(timeoutError(timeoutMs));
+      abort.abort(new TimeoutError(timeoutMs));
     }, timeoutMs);
     const dispatched = this.dispatchNode(
       workflow,
@@ -515,7 +496,7 @@ export class WorkflowEngine {
         ]);
       }
       const reason: unknown = abort.signal.aborted ? abort.signal.reason : undefined;
-      throw isTimeoutError(reason) || reason instanceof CancelledError ? reason : error;
+      throw reason instanceof TimeoutError || reason instanceof CancelledError ? reason : error;
     } finally {
       clearTimeout(timer);
       this.activeAbort = null;
@@ -579,9 +560,6 @@ export class WorkflowEngine {
     const basePrompt = await node.prompt(context);
     const spawn = await resolveAgentSpawn(node, nodeId, context);
     if (signal.aborted) {
-      // The node timed out or the run was cancelled while the async prompt
-      // builder ran; a late continuation must not write into a bundle that
-      // may already be terminal.
       throw abortError(signal);
     }
     const artifactDir = path.join(runDir, "agents", nodeId, attemptId);
@@ -620,7 +598,11 @@ export class WorkflowEngine {
       },
       signal,
     );
-    return { output: submission.output, promptText: prompt };
+    return {
+      output: submission.output,
+      promptText: prompt,
+      ...(submission.conversation !== undefined ? { conversation: submission.conversation } : {}),
+    };
   }
 
   private async acceptSubmission(
@@ -678,6 +660,13 @@ export class WorkflowEngine {
     if (status === "failed" && state.status === "timed_out") {
       status = "timed_out";
     }
+    // Let observers (e.g. the session recorder) stop and drain before the
+    // terminal event exists, so the bundle is immutable from that point on.
+    try {
+      await this.onRunFinishing?.(runDir, state);
+    } catch {
+      // Finishing the run wins over observer failures.
+    }
     state.status = status;
     state.finishedAt = new Date().toISOString();
     if (fields.error !== undefined) {
@@ -691,7 +680,6 @@ export class WorkflowEngine {
     }
     delete state.currentNode;
     delete state.currentAttemptId;
-    delete state.currentNodeType;
     delete state.currentNodeStartedAt;
     await this.persist(runDir, state, {
       scope: "run",
@@ -700,6 +688,7 @@ export class WorkflowEngine {
         status,
         ...(fields.error !== undefined ? { error: fields.error } : {}),
         ...(fields.waitingOn !== undefined ? { waitingOn: fields.waitingOn } : {}),
+        ...(fields.finalOutput !== undefined ? { finalOutput: fields.finalOutput } : {}),
       },
     });
   }
@@ -750,8 +739,8 @@ async function runShellActionNode(
 /** Rejects with the abort reason once the signal fires; never resolves. */
 /** The error carried by an aborted signal, normalized to an Error. */
 function abortError(signal: AbortSignal): Error {
-  const reason: unknown = signal.reason ?? cancelledError();
-  return reason instanceof Error ? reason : cancelledError(String(reason));
+  const reason: unknown = signal.reason ?? new CancelledError();
+  return reason instanceof Error ? reason : new CancelledError(String(reason));
 }
 
 function abortRejection(signal: AbortSignal): Promise<never> {
@@ -837,17 +826,12 @@ async function resolveAgentSpawn(
   context: WorkflowNodeContext,
 ): Promise<ResolvedAgentSpawn> {
   const spawn = node.spawn ?? {};
-  const name =
-    typeof spawn.name === "function"
-      ? await spawn.name(context)
-      : (spawn.name ?? nodeId);
+  const name = typeof spawn.name === "function" ? await spawn.name(context) : (spawn.name ?? nodeId);
   if (typeof name !== "string" || name.trim().length === 0) {
     throw new Error(`Agent node ${nodeId} resolved an empty spawn.name`);
   }
   const systemPrompt =
-    typeof spawn.systemPrompt === "function"
-      ? await spawn.systemPrompt(context)
-      : spawn.systemPrompt;
+    typeof spawn.systemPrompt === "function" ? await spawn.systemPrompt(context) : spawn.systemPrompt;
   const cwd = typeof spawn.cwd === "function" ? await spawn.cwd(context) : spawn.cwd;
   return {
     name: name.trim(),
