@@ -91,7 +91,7 @@ The child extension registers `workflow_done`, writes `result.json`, and returns
 
 ## Run bundles
 
-The workflow core tracks upstream `pi-workflows` v0.2.0. Every run writes a private `0700` bundle with an append-only trace, atomic state and manifest projections, a serializable workflow snapshot, and content-addressed artifacts for strings larger than 4096 bytes. Files are `0600`.
+The workflow core tracks upstream `pi-workflows` v0.3.0 (selective graft: park/resume, checkpoint continuation, functional `timeoutMs`). Every run writes a private `0700` bundle with an append-only trace, atomic state and manifest projections, a serializable workflow snapshot, and content-addressed artifacts for strings larger than 4096 bytes. Files are `0600`.
 
 The trace is the workflow replay source of truth. Herdr attempt files remain separate under `agents/<node>/<attempt>/` because they are the live child protocol, not deduplicated run data. Full Pi session-event replay is not exposed yet because child conversations occur in separate Herdr panes. See [`docs/upstream-sync.md`](docs/upstream-sync.md) for the pinned revision and sync boundary.
 

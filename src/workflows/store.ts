@@ -85,16 +85,66 @@ type RunBundleContext = {
  * into content-addressed `artifacts/`. Bundles are private: directories are
  * 0700 and files 0600.
  */
+/**
+ * A fence proves the writer still owns the run. It is checked before every
+ * locked write; it throws (ClaimLostError) when the queue claim was lost, so
+ * a stalled runner can never interleave writes with the new claim holder.
+ */
+export type RunFence = () => void;
+
+export type WorkflowRunStoreOptions = {
+  fenceProvider?: (runDir: string) => RunFence | undefined;
+};
+
 export class WorkflowRunStore {
   readonly outputRoot: string;
+  private readonly fenceProvider: ((runDir: string) => RunFence | undefined) | undefined;
   private readonly contexts = new Map<string, RunBundleContext>();
 
-  constructor(outputRoot: string = workflowRunsBaseDir()) {
+  constructor(outputRoot: string = workflowRunsBaseDir(), options: WorkflowRunStoreOptions = {}) {
     this.outputRoot = outputRoot;
+    this.fenceProvider = options.fenceProvider;
   }
 
   runDirFor(runId: string): string {
+    assertValidRunId(runId);
     return path.join(this.outputRoot, runId);
+  }
+
+  /**
+   * Move a reserved run directory that never finished initializing out of the
+   * way so a later run can reuse the id. Returns the quarantine path, or
+   * undefined when nothing was present.
+   */
+  async quarantineIncompleteRun(runId: string): Promise<string | undefined> {
+    const runDir = this.runDirFor(runId);
+    let runStat;
+    try {
+      runStat = await fs.lstat(runDir);
+    } catch (error) {
+      if (isMissingPath(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+    if (!runStat.isDirectory() || runStat.isSymbolicLink()) {
+      throw new Error(`Reserved workflow run path is not a directory: ${runDir}`);
+    }
+    try {
+      await fs.lstat(path.join(runDir, MANIFEST_PATH));
+      throw new Error(`Reserved workflow run has an unreadable manifest: ${runId}`);
+    } catch (error) {
+      if (!isMissingPath(error)) {
+        throw error;
+      }
+    }
+    const quarantineDir = path.join(
+      this.outputRoot,
+      `.${runId}.incomplete-${randomUUID().slice(0, 8)}`,
+    );
+    await fs.rename(runDir, quarantineDir);
+    this.contexts.delete(runDir);
+    return quarantineDir;
   }
 
   private contextFor(runDir: string): RunBundleContext {
@@ -121,7 +171,10 @@ export class WorkflowRunStore {
    */
   private withRunLock<T>(runDir: string, task: () => Promise<T>): Promise<T> {
     const context = this.contextFor(runDir);
-    const result = context.lock.then(task);
+    const result = context.lock.then(async () => {
+      this.fenceProvider?.(runDir)?.();
+      return await task();
+    });
     context.lock = result.then(
       () => undefined,
       () => undefined,
@@ -131,7 +184,10 @@ export class WorkflowRunStore {
 
   private withSessionEventLock<T>(runDir: string, task: () => Promise<T>): Promise<T> {
     const context = this.contextFor(runDir);
-    const result = context.sessionEventLock.then(task);
+    const result = context.sessionEventLock.then(async () => {
+      this.fenceProvider?.(runDir)?.();
+      return await task();
+    });
     context.sessionEventLock = result.then(
       () => undefined,
       () => undefined,
@@ -155,6 +211,161 @@ export class WorkflowRunStore {
       await this.writeProjections(runDir, state);
       return runDir;
     });
+  }
+
+  /**
+   * Prepare an interrupted bundle for resume. Repairs a torn trace tail and
+   * seeds the in-process context so new events continue the sequence.
+   */
+  async prepareRunResume(runId: string): Promise<LoadedRunBundle> {
+    const runDir = this.runDirFor(runId);
+    this.fenceProvider?.(runDir)?.();
+    const bundle = await readRunBundle(runDir);
+    if (bundle === null) {
+      throw new Error(`Cannot resume unreadable workflow run: ${runId}`);
+    }
+    if (bundle.state.status !== "running") {
+      throw new Error(`Cannot resume workflow run ${runId} with status ${bundle.state.status}`);
+    }
+    const tracePath = resolveBundlePath(runDir, bundle.manifest.paths.trace, TRACE_PATH);
+    await repairTraceFile(tracePath, bundle.state.traceSeq, () => {
+      this.fenceProvider?.(runDir)?.();
+    });
+
+    // Finalize a dangling session capture so resume does not report the run
+    // as capture-corrupt forever. Herdr does not bind the upstream recorder,
+    // but callers may still write a capture file.
+    const sessionCapture = await readJsonFile<WorkflowSessionCapture>(
+      path.join(runDir, SESSION_CAPTURE_PATH),
+    );
+    if (sessionCapture?.status === "recording") {
+      const events = await readNdjsonFile<WorkflowSessionEventRecord>(
+        path.join(runDir, SESSION_EVENTS_PATH),
+      );
+      const entries = await readNdjsonFile<WorkflowSessionEntryRecord>(
+        path.join(runDir, SESSION_ENTRIES_PATH),
+      );
+      await this.writeSessionCapture(runDir, {
+        schema: SESSION_CAPTURE_SCHEMA,
+        eventSchema: SESSION_EVENT_SCHEMA,
+        status: "failed",
+        eventCount: events.records.length,
+        entryCount: entries.records.length,
+        lastEventSeq: events.records.at(-1)?.seq ?? 0,
+        failure: {
+          failedAt: new Date().toISOString(),
+          code: "host_interrupted",
+          message: "Workflow host stopped before the run finished",
+        },
+      });
+    }
+
+    const events = await readNdjsonFile<WorkflowSessionEventRecord>(
+      path.join(runDir, SESSION_EVENTS_PATH),
+    );
+    const entries = await readNdjsonFile<WorkflowSessionEntryRecord>(
+      path.join(runDir, SESSION_ENTRIES_PATH),
+    );
+    const capture = await readJsonFile<WorkflowSessionCapture>(
+      path.join(runDir, SESSION_CAPTURE_PATH),
+    );
+    const captureFinished = capture?.status === "complete" || capture?.status === "failed";
+    this.contexts.set(runDir, {
+      traceSeq: bundle.state.traceSeq,
+      sessionSeq: entries.records.length,
+      sessionEventSeq: events.records.at(-1)?.seq ?? 0,
+      sessionBound: bundle.manifest.paths.session !== undefined,
+      sessionEventsStopped: captureFinished,
+      artifacts: new ArtifactWriter(runDir),
+      lock: Promise.resolve(),
+      sessionEventLock: Promise.resolve(),
+    });
+    const prepared = await readRunBundle(runDir);
+    if (prepared === null) {
+      throw new Error(`Workflow run ${runId} became unreadable during resume preparation`);
+    }
+    return prepared;
+  }
+
+  /** Mark a nonterminal bundle failed and append an interruption event. */
+  async markRunInterrupted(
+    runId: string,
+    reason = "Workflow host stopped before the run finished",
+  ): Promise<LoadedRunBundle | null> {
+    const runDir = this.runDirFor(runId);
+    const bundle = await readRunBundle(runDir);
+    if (bundle === null || bundle.state.status !== "running") {
+      return bundle;
+    }
+    const lastTraceEvent = await readLastTraceEvent(runDir, bundle.manifest.paths.trace);
+    const events = await readNdjsonFile<WorkflowSessionEventRecord>(
+      path.join(runDir, SESSION_EVENTS_PATH),
+    );
+    const entries = await readNdjsonFile<WorkflowSessionEntryRecord>(
+      path.join(runDir, SESSION_ENTRIES_PATH),
+    );
+    const sessionBound = bundle.manifest.paths.session !== undefined;
+    const captureFinished =
+      bundle.sessionCapture?.status === "complete" || bundle.sessionCapture?.status === "failed";
+    this.contexts.set(runDir, {
+      traceSeq: Math.max(bundle.state.traceSeq, lastTraceEvent?.seq ?? 0),
+      sessionSeq: entries.records.length,
+      sessionEventSeq: events.records.at(-1)?.seq ?? 0,
+      sessionBound,
+      sessionEventsStopped: captureFinished,
+      artifacts: new ArtifactWriter(runDir),
+      lock: Promise.resolve(),
+      sessionEventLock: Promise.resolve(),
+    });
+    const state = bundle.state;
+    if (lastTraceEvent !== null && recoverTerminalProjection(state, lastTraceEvent)) {
+      await this.writeLoadedProjections(runDir, state);
+      return await readRunBundle(runDir);
+    }
+    if (sessionBound && !captureFinished) {
+      await this.writeSessionCapture(runDir, {
+        schema: SESSION_CAPTURE_SCHEMA,
+        eventSchema: SESSION_EVENT_SCHEMA,
+        status: "failed",
+        eventCount: events.records.length,
+        entryCount: entries.records.length,
+        lastEventSeq: events.records.at(-1)?.seq ?? 0,
+        failure: {
+          failedAt: new Date().toISOString(),
+          code: "host_interrupted",
+          message: reason,
+        },
+      });
+    }
+    state.status = "failed";
+    state.finishedAt = new Date().toISOString();
+    state.error = reason;
+    delete state.currentNode;
+    delete state.currentAttemptId;
+    delete state.currentNodeStartedAt;
+    delete state.statusDetail;
+    delete state.paused;
+    await this.withRunLock(runDir, async () => {
+      const traceEvent = await this.appendTraceEvent(runDir, state.runId, {
+        scope: "run",
+        type: "run_interrupted",
+        payload: { error: reason },
+      });
+      state.traceSeq = traceEvent.seq;
+      state.updatedAt = traceEvent.at;
+      await this.writeLoadedProjections(runDir, state);
+    });
+    return await readRunBundle(runDir);
+  }
+
+  private async writeLoadedProjections(runDir: string, state: WorkflowRunState): Promise<void> {
+    const context = this.contextFor(runDir);
+    const encoded = await encodeRunState(state, context.artifacts);
+    await writeJsonAtomic(path.join(runDir, STATE_PATH), encoded);
+    await writeJsonAtomic(
+      path.join(runDir, MANIFEST_PATH),
+      createManifest(state, { session: context.sessionBound }),
+    );
   }
 
   /**
@@ -808,7 +1019,7 @@ export function createDefinitionSnapshot(workflow: WorkflowDefinition): Workflow
 function snapshotNode(node: WorkflowNodeDefinition): WorkflowNodeSnapshot {
   const common: WorkflowNodeSnapshot = {
     nodeType: node.nodeType,
-    ...(node.timeoutMs !== undefined ? { timeoutMs: node.timeoutMs } : {}),
+    ...(typeof node.timeoutMs === "number" ? { timeoutMs: node.timeoutMs } : {}),
     ...(node.statusDetail !== undefined ? { statusDetail: node.statusDetail } : {}),
   };
   if (node.nodeType === "agent") {
@@ -843,6 +1054,113 @@ function snapshotNode(node: WorkflowNodeDefinition): WorkflowNodeSnapshot {
     common.actionExecution = "exec" in node ? "shell" : "function";
   }
   return common;
+}
+
+async function repairTraceFile(
+  tracePath: string,
+  keepSeq: number,
+  beforeWrite?: () => void,
+): Promise<void> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(tracePath, "utf8");
+  } catch {
+    return;
+  }
+  const lines = raw.split("\n");
+  if (lines.at(-1) === "") {
+    lines.pop();
+  }
+  const good: string[] = [];
+  let expectedSeq = 1;
+  for (const line of lines) {
+    if (line.trim().length === 0) {
+      break;
+    }
+    try {
+      const event = JSON.parse(line) as { seq?: unknown };
+      if (event.seq !== expectedSeq) {
+        break;
+      }
+      good.push(line);
+      expectedSeq += 1;
+    } catch {
+      break;
+    }
+  }
+  const kept = good.slice(0, keepSeq);
+  if (kept.length === lines.length) {
+    return;
+  }
+  beforeWrite?.();
+  const tempPath = `${tracePath}.${process.pid}.${randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, kept.length === 0 ? "" : `${kept.join("\n")}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await fs.rename(tempPath, tracePath);
+}
+
+function recoverTerminalProjection(state: WorkflowRunState, event: WorkflowTraceEvent): boolean {
+  const status = terminalStatusForEvent(event.type);
+  if (status === undefined) {
+    return false;
+  }
+  state.traceSeq = event.seq;
+  state.status = status;
+  state.updatedAt = event.at;
+  state.finishedAt = event.at;
+  if (typeof event.payload.error === "string") {
+    state.error = event.payload.error;
+  }
+  if (typeof event.payload.waitingOn === "string") {
+    state.waitingOn = event.payload.waitingOn;
+  }
+  if (Object.hasOwn(event.payload, "finalOutput")) {
+    state.finalOutput = event.payload.finalOutput;
+  }
+  delete state.currentNode;
+  delete state.currentAttemptId;
+  delete state.currentNodeStartedAt;
+  return true;
+}
+
+function terminalStatusForEvent(type: string): WorkflowRunState["status"] | undefined {
+  switch (type) {
+    case "run_waiting":
+      return "waiting";
+    case "run_completed":
+      return "completed";
+    case "run_failed":
+    case "run_interrupted":
+      return "failed";
+    case "run_timed_out":
+      return "timed_out";
+    case "run_cancelled":
+      return "cancelled";
+    default:
+      return undefined;
+  }
+}
+
+function assertValidRunId(runId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(runId)) {
+    throw new Error(`Invalid workflow run id: ${JSON.stringify(runId)}`);
+  }
+}
+
+function isMissingPath(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+export async function readLastTraceEvent(
+  runDir: string,
+  tracePath?: string,
+): Promise<WorkflowTraceEvent | null> {
+  const events = await readNdjsonFile<WorkflowTraceEvent>(
+    resolveBundlePath(runDir, tracePath, TRACE_PATH),
+  );
+  return events.records.at(-1) ?? null;
 }
 
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {

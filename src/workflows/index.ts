@@ -9,7 +9,8 @@ export {
 } from "./definition.js";
 export { decision, decisionEdge, type DecisionDefinition } from "./decision.js";
 export { WorkflowEngine, appendStepContract } from "./engine.js";
-export { CancelledError, TimeoutError } from "./errors.js";
+export { CancelledError, ClaimLostError, TimeoutError, WorkflowSourceChangedError } from "./errors.js";
+export { isClaimLostError, isRunParkedError } from "./errors.js";
 export {
   extractJsonValue,
   parseJsonValue,
@@ -19,6 +20,7 @@ export {
 export { resolveNext, resolveNextForOutcome, validateWorkflowDefinition } from "./graph.js";
 export {
   discoverWorkflows,
+  hashWorkflowSource,
   loadWorkflowFile,
   resolveWorkflowRef,
   workflowFileStem,
@@ -46,9 +48,12 @@ export {
   createDefinitionSnapshot,
   createRunId,
   listRunBundles,
+  readLastTraceEvent,
   readRunBundle,
   workflowRunsBaseDir,
   type LoadedRunBundle,
+  type RunFence,
+  type WorkflowRunStoreOptions,
 } from "./store.js";
 export type {
   AgentNodeDefinition,

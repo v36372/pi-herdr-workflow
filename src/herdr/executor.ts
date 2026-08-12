@@ -249,6 +249,19 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     };
     const agentName = liveAgentName(spawn.name, contract.attemptId);
     let closedPane = false;
+    let interruptRequested = false;
+
+    const interruptAgent = (): void => {
+      if (interruptRequested) return;
+      interruptRequested = true;
+      // Best-effort: stop the live child so a timed-out/cancelled attempt cannot
+      // keep working after the engine has closed the step.
+      void this.client.agentSendKeys(agentName, ["Escape"]).catch(() => undefined);
+    };
+    signal.addEventListener("abort", interruptAgent, { once: true });
+    if (signal.aborted) {
+      interruptAgent();
+    }
 
     try {
       await this.prepareAgentEnvironment(paneId, startContext, signal);
@@ -374,6 +387,7 @@ export class HerdrStepExecutor implements AgentStepExecutor {
         `Agent output rejected after ${this.maxValidationAttempts} submission(s): ${lastFailure?.message ?? "unknown validation error"}`,
       );
     } finally {
+      signal.removeEventListener("abort", interruptAgent);
       this.lastPaneId = closedPane ? this.rootPaneId : paneId;
       // agent.start can steal UI focus into the run workspace; put the user
       // back on the orchestrator between steps and before dispose/close.
