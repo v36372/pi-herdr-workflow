@@ -83,9 +83,10 @@ function assertValidSpawn(spawn: AgentNodeDefinition["spawn"], nodeId: string): 
 function assertCommonNodeFields(node: WorkflowNodeDefinition, nodeId: string): void {
   if (
     node.timeoutMs !== undefined &&
+    typeof node.timeoutMs !== "function" &&
     (typeof node.timeoutMs !== "number" || !Number.isFinite(node.timeoutMs) || node.timeoutMs <= 0)
   ) {
-    fail(`node ${nodeId} timeoutMs must be a finite positive number`);
+    fail(`node ${nodeId} timeoutMs must be a finite positive number or function`);
   }
   if (node.statusDetail !== undefined && typeof node.statusDetail !== "string") {
     fail(`node ${nodeId} statusDetail must be a string`);
@@ -210,7 +211,7 @@ function assertValidEdgeShape(edge: WorkflowEdge, index: number): void {
  * Names claimed by `/workflow` subcommands; a workflow with one of these
  * names could never be started because the keyword wins the argument slot.
  */
-const RESERVED_WORKFLOW_NAMES = new Set(["cancel", "list", "pause", "resume"]);
+const RESERVED_WORKFLOW_NAMES = new Set(["answer", "cancel", "list", "pause", "resume", "status"]);
 
 export function assertValidWorkflowDefinitionShape(definition: WorkflowDefinition): void {
   assertRecord(definition, "workflow");

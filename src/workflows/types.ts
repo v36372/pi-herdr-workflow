@@ -20,8 +20,11 @@ export type WorkflowNodeContext<TInput = unknown> = {
 };
 
 export type WorkflowNodeCommon = {
-  /** Per-node timeout. Falls back to the engine default (15 minutes). */
-  timeoutMs?: number;
+  /**
+   * Per-node timeout or a callback that derives it from the run context.
+   * Falls back to the engine default (15 minutes).
+   */
+  timeoutMs?: number | ((context: WorkflowNodeContext) => MaybePromise<number>);
   /** Short human-readable label shown in the viewer while the node runs. */
   statusDetail?: string;
 };
@@ -270,8 +273,18 @@ export type WorkflowRunState = {
   traceSeq: number;
   runId: string;
   workflowName: string;
+  /** Set on continuation runs: the checkpointed run this one carries forward. */
+  parentRunId?: string;
+  /**
+   * Steps carried from the parent at continuation start. Steps beyond this
+   * count were recorded by this run itself; resume uses it to tell a
+   * carried checkpoint from this run's own.
+   */
+  carriedStepCount?: number;
   runTitle?: string;
   workflowPath?: string;
+  /** SHA-256 of the workflow source at run start; resume refuses mismatches. */
+  workflowHash?: string;
   startedAt: string;
   finishedAt?: string;
   updatedAt: string;

@@ -25,16 +25,29 @@ exact_files=(
   artifacts.ts
   decision.ts
   definition.ts
-  errors.ts
-  graph.ts
   json.ts
   shell.ts
   text.ts
+)
+
+head_exact_files=(
+  errors.ts
+  graph.ts
 )
 
 for file in "${exact_files[@]}"; do
   cmp "$project_root/src/workflows/$file" "$checkout/src/workflows/$file"
   printf 'exact %s\n' "$file"
 done
+
+if [[ "${SKIP_HEAD_EXACT:-}" != "1" ]]; then
+  head_checkout="$(mktemp -d "${TMPDIR:-/tmp}/pi-workflows-head.XXXXXX")"
+  trap 'rm -rf "$temporary_checkout" "$head_checkout"' EXIT
+  git clone --quiet "$upstream_url" "$head_checkout"
+  for file in "${head_exact_files[@]}"; do
+    cmp "$project_root/src/workflows/$file" "$head_checkout/src/workflows/$file"
+    printf 'exact-head %s\n' "$file"
+  done
+fi
 
 printf '%s\n' 'Herdr graft files: engine.ts index.ts loader.ts schema.ts store.ts types.ts'

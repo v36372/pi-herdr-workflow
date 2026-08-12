@@ -11,17 +11,21 @@ import {
   type AgentStepExecutor,
   type AgentStepRequest,
   type AgentStepSubmission,
+  type ResolvedAgentSpawn,
 } from "../src/index.ts";
 import { writeFakeAgentResult } from "../src/herdr/executor.ts";
+import { assertValidAgentNode, assertValidWorkflowDefinitionShape } from "../src/workflows/schema.ts";
 
-class FileBackedExecutor implements AgentStepExecutor {
+class CapturingExecutor implements AgentStepExecutor {
   lastRequest: AgentStepRequest | null = null;
+  requests: AgentStepRequest[] = [];
 
   async runAgentStep(
     request: AgentStepRequest,
     _signal: AbortSignal,
   ): Promise<AgentStepSubmission> {
     this.lastRequest = request;
+    this.requests.push(request);
     writeFakeAgentResult({
       resultPath: request.contract.resultPath,
       runId: request.contract.runId,
@@ -36,9 +40,44 @@ class FileBackedExecutor implements AgentStepExecutor {
   }
 }
 
+function runWithSpawn(
+  spawn: NonNullable<Parameters<typeof agent>[0]["spawn"]>,
+  input: unknown = {},
+): Promise<{ spawn: ResolvedAgentSpawn; prompt: string; request: AgentStepRequest }> {
+  const outputRoot = mkdtempSync(path.join(tmpdir(), "phw-spawn-"));
+  const executor = new CapturingExecutor();
+  const engine = new WorkflowEngine({ executor, outputRoot, maxSteps: 10 });
+  const workflow = defineWorkflow({
+    name: "spawn-matrix",
+    startAt: "reply",
+    nodes: {
+      reply: agent({
+        spawn,
+        prompt: () => "say pong",
+        expectedOutput: `{ "reply": "…" }`,
+      }),
+    },
+    edges: [],
+  });
+  return engine
+    .run(workflow, input)
+    .then(({ state }) => {
+      assert.equal(state.status, "completed");
+      assert.ok(executor.lastRequest);
+      return {
+        spawn: executor.lastRequest!.spawn,
+        prompt: executor.lastRequest!.prompt,
+        request: executor.lastRequest!,
+      };
+    })
+    .finally(() => {
+      rmSync(outputRoot, { recursive: true, force: true });
+    });
+}
+
 test("agent node resolves spawn params and result paths", async () => {
   const outputRoot = mkdtempSync(path.join(tmpdir(), "phw-"));
-  const executor = new FileBackedExecutor();
+  const executor = new CapturingExecutor();
   const engine = new WorkflowEngine({ executor, outputRoot, maxSteps: 10 });
 
   const workflow = defineWorkflow({
@@ -79,4 +118,257 @@ test("agent node resolves spawn params and result paths", async () => {
   } finally {
     rmSync(outputRoot, { recursive: true, force: true });
   }
+});
+
+test("every spawn param resolves into AgentStepRequest.spawn", async () => {
+  const { spawn, prompt, request } = await runWithSpawn(
+    {
+      name: ({ input }) => `Scout: ${(input as { label: string }).label}`,
+      agent: "scout",
+      systemPrompt: ({ input }) => `Role for ${(input as { label: string }).label}`,
+      model: "openai-codex/gpt-5.6-luna",
+      thinking: "high",
+      skills: "search,review",
+      tools: "read,bash,grep",
+      extensions: ["/tmp/pi-ask/index.ts", "/tmp/companion.ts"],
+      cwd: ({ input }) => `/tmp/work/${(input as { label: string }).label}`,
+      kind: "pi-wiz",
+      fork: true,
+      interactive: true,
+      closePaneAfterDone: true,
+    },
+    { label: "Auth" },
+  );
+
+  assert.deepEqual(spawn, {
+    name: "Scout: Auth",
+    agent: "scout",
+    systemPrompt: "Role for Auth",
+    model: "openai-codex/gpt-5.6-luna",
+    thinking: "high",
+    skills: "search,review",
+    tools: "read,bash,grep",
+    extensions: ["/tmp/pi-ask/index.ts", "/tmp/companion.ts"],
+    cwd: "/tmp/work/Auth",
+    kind: "pi-wiz",
+    fork: true,
+    interactive: true,
+    closePaneAfterDone: true,
+  });
+  assert.equal(request.contract.nodeId, "reply");
+  assert.match(request.contract.artifactDir, /agents\/reply\//);
+  assert.match(prompt, /workflow_done/);
+});
+
+test("spawn.name defaults to the node id and fork/closePaneAfterDone default false", async () => {
+  const { spawn } = await runWithSpawn({});
+  assert.equal(spawn.name, "reply");
+  assert.equal(spawn.fork, false);
+  assert.equal(spawn.closePaneAfterDone, false);
+  assert.equal(spawn.agent, undefined);
+  assert.equal(spawn.systemPrompt, undefined);
+  assert.equal(spawn.model, undefined);
+  assert.equal(spawn.thinking, undefined);
+  assert.equal(spawn.skills, undefined);
+  assert.equal(spawn.tools, undefined);
+  assert.equal(spawn.extensions, undefined);
+  assert.equal(spawn.cwd, undefined);
+  assert.equal(spawn.kind, undefined);
+  assert.equal(spawn.interactive, undefined);
+});
+
+test("spawn.name string and empty resolved name are rejected", async () => {
+  const { spawn } = await runWithSpawn({ name: "fixed-agent" });
+  assert.equal(spawn.name, "fixed-agent");
+
+  const outputRoot = mkdtempSync(path.join(tmpdir(), "phw-empty-name-"));
+  const executor = new CapturingExecutor();
+  const engine = new WorkflowEngine({ executor, outputRoot, maxSteps: 10 });
+  const workflow = defineWorkflow({
+    name: "empty-name",
+    startAt: "reply",
+    nodes: {
+      reply: agent({
+        spawn: { name: () => "   " },
+        prompt: () => "say pong",
+      }),
+    },
+    edges: [],
+  });
+  try {
+    const { state } = await engine.run(workflow, {});
+    assert.equal(state.status, "failed");
+    assert.match(state.error ?? "", /resolved an empty spawn\.name/);
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test("spawn.systemPrompt and spawn.cwd accept static strings", async () => {
+  const { spawn } = await runWithSpawn({
+    name: "static",
+    systemPrompt: "Be concise",
+    cwd: "/tmp/project",
+  });
+  assert.equal(spawn.systemPrompt, "Be concise");
+  assert.equal(spawn.cwd, "/tmp/project");
+});
+
+test("spawn.kind accepts pi and pi-wiz only", async () => {
+  const pi = await runWithSpawn({ name: "a", kind: "pi" });
+  assert.equal(pi.spawn.kind, "pi");
+  const wiz = await runWithSpawn({ name: "b", kind: "pi-wiz" });
+  assert.equal(wiz.spawn.kind, "pi-wiz");
+
+  assert.throws(
+    () =>
+      assertValidAgentNode(
+        agent({
+          spawn: { kind: "mux" as "pi" },
+          prompt: () => "x",
+        }),
+      ),
+    /spawn\.kind must be "pi" or "pi-wiz"/,
+  );
+});
+
+test("spawn.extensions must be a non-empty string array when present", () => {
+  assert.throws(
+    () =>
+      assertValidAgentNode(
+        agent({
+          spawn: { extensions: ["", "/tmp/ok.ts"] },
+          prompt: () => "x",
+        }),
+      ),
+    /spawn\.extensions must be an array of non-empty strings/,
+  );
+  assert.throws(
+    () =>
+      assertValidAgentNode(
+        agent({
+          spawn: { extensions: "/tmp/ok.ts" as unknown as string[] },
+          prompt: () => "x",
+        }),
+      ),
+    /spawn\.extensions must be an array of non-empty strings/,
+  );
+});
+
+test("spawn boolean and string fields reject wrong types", () => {
+  const cases: Array<{ spawn: Record<string, unknown>; message: RegExp }> = [
+    { spawn: { name: 1 }, message: /spawn\.name must be a string or function/ },
+    { spawn: { agent: 1 }, message: /spawn\.agent must be a string/ },
+    { spawn: { systemPrompt: 1 }, message: /spawn\.systemPrompt must be a string or function/ },
+    { spawn: { model: 1 }, message: /spawn\.model must be a string/ },
+    { spawn: { thinking: 1 }, message: /spawn\.thinking must be a string/ },
+    { spawn: { skills: 1 }, message: /spawn\.skills must be a string/ },
+    { spawn: { tools: 1 }, message: /spawn\.tools must be a string/ },
+    { spawn: { cwd: 1 }, message: /spawn\.cwd must be a string or function/ },
+    { spawn: { fork: "yes" }, message: /spawn\.fork must be a boolean/ },
+    { spawn: { interactive: "yes" }, message: /spawn\.interactive must be a boolean/ },
+    {
+      spawn: { closePaneAfterDone: "yes" },
+      message: /spawn\.closePaneAfterDone must be a boolean/,
+    },
+  ];
+  for (const { spawn, message } of cases) {
+    assert.throws(
+      () =>
+        assertValidAgentNode(
+          agent({
+            spawn: spawn as never,
+            prompt: () => "x",
+          }),
+        ),
+      message,
+    );
+  }
+});
+
+test("spawn.fork false and interactive false stay explicit in the resolved spawn", async () => {
+  const { spawn } = await runWithSpawn({
+    name: "flags",
+    fork: false,
+    interactive: false,
+    closePaneAfterDone: false,
+  });
+  assert.equal(spawn.fork, false);
+  assert.equal(spawn.interactive, false);
+  assert.equal(spawn.closePaneAfterDone, false);
+});
+
+test("workflow timeoutMs accepts a context callback", async () => {
+  const outputRoot = mkdtempSync(path.join(tmpdir(), "phw-timeout-fn-"));
+  const executor = new CapturingExecutor();
+  const engine = new WorkflowEngine({ executor, outputRoot, maxSteps: 10 });
+  let seenTimeoutInput: unknown;
+  const workflow = defineWorkflow({
+    name: "timeout-fn",
+    startAt: "reply",
+    nodes: {
+      reply: agent({
+        timeoutMs: ({ input }) => {
+          seenTimeoutInput = input;
+          return 5_000;
+        },
+        spawn: { name: "t" },
+        prompt: () => "go",
+      }),
+    },
+    edges: [],
+  });
+  try {
+    const { state } = await engine.run(workflow, { budget: 5_000 });
+    assert.equal(state.status, "completed");
+    assert.deepEqual(seenTimeoutInput, { budget: 5_000 });
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+  }
+});
+
+test("schema allows timeoutMs functions and rejects invalid values", () => {
+  assertValidAgentNode(
+    agent({
+      timeoutMs: () => 1_000,
+      prompt: () => "x",
+    }),
+  );
+  assert.throws(
+    () =>
+      assertValidAgentNode(
+        agent({
+          timeoutMs: 0,
+          prompt: () => "x",
+        }),
+      ),
+    /timeoutMs must be a finite positive number or function/,
+  );
+});
+
+test("reserved workflow names include answer and status", () => {
+  assert.throws(
+    () =>
+      assertValidWorkflowDefinitionShape(
+        defineWorkflow({
+          name: "answer",
+          startAt: "a",
+          nodes: { a: compute({ run: () => ({}) }) },
+          edges: [],
+        }),
+      ),
+    /reserved/,
+  );
+  assert.throws(
+    () =>
+      assertValidWorkflowDefinitionShape(
+        defineWorkflow({
+          name: "status",
+          startAt: "a",
+          nodes: { a: compute({ run: () => ({}) }) },
+          edges: [],
+        }),
+      ),
+    /reserved/,
+  );
 });

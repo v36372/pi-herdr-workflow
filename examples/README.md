@@ -22,6 +22,15 @@ spawn: { model: "openai-codex/gpt-5.6-luna", thinking: "low", ... }
 | `/workflow repair-on-fail` | shell ↔ repair agent | `$result.outcome` failure routing |
 | `/workflow plan-checkpoint` | agent → checkpoint | Human gate (`waiting`) |
 
+## Graded engine demos
+
+Levels 1–8 under [`examples/demo/`](demo/) exercise the engine with increasing complexity (compute → shell → functional `timeoutMs` → full spawn → switch rejoin → checkpoint `continueRun` → repair routing → park/resume). See [`demo/README.md`](demo/README.md).
+
+```bash
+npm run demo:workflows
+npm test   # includes test/demo-workflows.test.ts
+```
+
 ## Run
 
 From a Herdr session with this package installed:

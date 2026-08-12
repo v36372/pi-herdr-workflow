@@ -29,7 +29,7 @@ Write the run's final JSON shape and one `presentationPrompt` sentence.
 
 ### 2. Partition the graph
 
-One job per node. Classify each as `shell` / `compute` / `action` (facts), `agent` (judgment), `decision` (closed route), or `checkpoint` (human gate; no outgoing edge).
+One job per node. Classify each as `shell` / `compute` / `action` (facts), `agent` (judgment), `decision` (closed route), or `checkpoint` (human gate; may have an outgoing edge for continueRun continuations).
 
 **Done when:** every node has an id, a type, a one-sentence job, and named I/O shapes.
 

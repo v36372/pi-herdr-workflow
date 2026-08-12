@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +20,7 @@ export type WorkflowSearchPaths = {
   homeDir?: string;
 };
 
-/** Directories scanned for `*.workflow.ts` files, in precedence order. */
+/** Directories scanned for workflow files, in precedence order. */
 export function workflowSearchDirs(
   options: WorkflowSearchPaths,
 ): { dir: string; source: "project" | "global" }[] {
@@ -28,6 +29,13 @@ export function workflowSearchDirs(
     { dir: path.join(options.cwd, ".pi", "workflows"), source: "project" },
     { dir: path.join(homeDir, ".pi", "agent", "workflows"), source: "global" },
   ];
+}
+
+/** SHA-256 of a workflow source file, recorded in run state for resume pinning. */
+export async function hashWorkflowSource(filePath: string): Promise<string> {
+  return createHash("sha256")
+    .update(await fs.readFile(filePath))
+    .digest("hex");
 }
 
 function isWorkflowFile(fileName: string): boolean {
