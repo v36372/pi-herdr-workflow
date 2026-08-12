@@ -113,6 +113,7 @@ test("resumeRun refuses a workflow source hash mismatch unless forced", async ()
     nodes: {
       work: agent({ spawn: { name: "w" }, prompt: () => "x" }),
     },
+    edges: [],
   });
   try {
     const runPromise = engine.run(workflow, {}, { runId: "hash-1", workflowHash: "old" });
@@ -196,6 +197,7 @@ test("dynamic timeoutMs aborts a hanging agent node", async () => {
         prompt: () => "hang",
       }),
     },
+    edges: [],
   });
   try {
     const { state } = await engine.run(workflow, {});
@@ -221,6 +223,7 @@ test("fence provider turns later writes into ClaimLostError", async () => {
     name: "fence",
     startAt: "a",
     nodes: { a: compute({ run: () => ({ ok: true }) }) },
+    edges: [],
   });
   try {
     const { runDir, state } = await engine.run(workflow, {}, { runId: "fenced-1" });
@@ -343,6 +346,7 @@ test("markRunInterrupted fails a running bundle", async () => {
     name: "interrupt",
     startAt: "work",
     nodes: { work: agent({ spawn: { name: "w" }, prompt: () => "x" }) },
+    edges: [],
   });
   try {
     const runPromise = engine.run(workflow, {}, { runId: "interrupt-1" });

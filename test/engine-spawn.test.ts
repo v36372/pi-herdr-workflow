@@ -57,6 +57,7 @@ function runWithSpawn(
         expectedOutput: `{ "reply": "…" }`,
       }),
     },
+    edges: [],
   });
   return engine
     .run(workflow, input)
@@ -180,10 +181,27 @@ test("spawn.name string and empty resolved name are rejected", async () => {
   const { spawn } = await runWithSpawn({ name: "fixed-agent" });
   assert.equal(spawn.name, "fixed-agent");
 
-  await assert.rejects(
-    () => runWithSpawn({ name: () => "   " }),
-    /resolved an empty spawn\.name/,
-  );
+  const outputRoot = mkdtempSync(path.join(tmpdir(), "phw-empty-name-"));
+  const executor = new CapturingExecutor();
+  const engine = new WorkflowEngine({ executor, outputRoot, maxSteps: 10 });
+  const workflow = defineWorkflow({
+    name: "empty-name",
+    startAt: "reply",
+    nodes: {
+      reply: agent({
+        spawn: { name: () => "   " },
+        prompt: () => "say pong",
+      }),
+    },
+    edges: [],
+  });
+  try {
+    const { state } = await engine.run(workflow, {});
+    assert.equal(state.status, "failed");
+    assert.match(state.error ?? "", /resolved an empty spawn\.name/);
+  } finally {
+    rmSync(outputRoot, { recursive: true, force: true });
+  }
 });
 
 test("spawn.systemPrompt and spawn.cwd accept static strings", async () => {
@@ -298,6 +316,7 @@ test("workflow timeoutMs accepts a context callback", async () => {
         prompt: () => "go",
       }),
     },
+    edges: [],
   });
   try {
     const { state } = await engine.run(workflow, { budget: 5_000 });
@@ -335,6 +354,7 @@ test("reserved workflow names include answer and status", () => {
           name: "answer",
           startAt: "a",
           nodes: { a: compute({ run: () => ({}) }) },
+          edges: [],
         }),
       ),
     /reserved/,
@@ -346,6 +366,7 @@ test("reserved workflow names include answer and status", () => {
           name: "status",
           startAt: "a",
           nodes: { a: compute({ run: () => ({}) }) },
+          edges: [],
         }),
       ),
     /reserved/,
