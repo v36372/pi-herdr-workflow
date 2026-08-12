@@ -39,8 +39,8 @@ Same surface as interactive-subagents `subagent()`, minus mux tools. Set on `age
 | `cwd` | Child working directory. String or ctx callback. |
 | `kind` | `pi` (default) or `pi-wiz` (Wiz MCP env + `pi-mcp-adapter`; Herdr kind still `pi`). |
 | `fork` | Full-context fork of the orchestrator session (`pi --fork`). Standalone spawn requires a persisted parent session. |
-| `interactive` | Herdr: long waits are collaborative, not stalls. Ignored for standalone subprocess children. |
-| `closePaneAfterDone` | Herdr: close the pane after accepted `workflow_done` (default leave open). Ignored for standalone subprocess children. |
+| `interactive` | Herdr medium: long waits are collaborative, not stalls. Ignored for subprocess children. |
+| `closePaneAfterDone` | Herdr medium: close the pane after accepted `workflow_done` (default leave open). Ignored for subprocess children. |
 | `extensions` | Extra `pi -e` sources on the child. Settings discovery stays disabled (`-ne`). |
 
 Named-agent markdown may set `model`, `thinking`, `tools`, `skill`/`skills`, `cwd`, and `system-prompt: append|replace`. Explicit spawn fields win. Unknown agent or skill fails the node before Pi starts.
@@ -96,7 +96,7 @@ Under `~/.pi/agent/workflows/runs/<runId>/agents/<nodeId>/<attemptId>/`:
 | `result.json` | child (`workflow_done`) | Authoritative structured output |
 | `agent-env.sh` | orchestrator | `PI_WORKFLOW_*` env sourced before agent start |
 
-Child extension registers `workflow_done`, writes `result.json`, returns `terminate: true`. `herdr agent prompt --wait` then wakes the executor.
+Child extension registers `workflow_done`, writes `result.json`, returns `terminate: true`. The medium then wakes the protocol (`herdr agent prompt --wait`, child `pi -p` exit, or a test mock).
 
 ## Context available to callbacks
 
@@ -105,7 +105,12 @@ Child extension registers `workflow_done`, writes `result.json`, returns `termin
 ## Library use (no `/workflow`)
 
 ```ts
-import { WorkflowEngine, HerdrStepExecutor, PiProcessExecutor } from "pi-herdr-workflows";
+import {
+  WorkflowEngine,
+  HerdrStepExecutor,
+  PiProcessExecutor,
+  MockAgentExecutor,
+} from "pi-herdr-workflows";
 
 const executor = process.env.HERDR_ENV === "1"
   ? new HerdrStepExecutor({ cwd: process.cwd() })
@@ -115,9 +120,15 @@ const result = await engine.run(myWorkflow, { task: "…" });
 await executor.dispose();
 ```
 
+Tests mock the medium and keep retries / `result.json`:
+
+```ts
+const executor = new MockAgentExecutor(({ prompt }) => ({ echo: "pong" }));
+```
+
 ## Ceilings (design within these)
 
 - Workflow owns lifecycle: agents are fresh ephemeral Pi sessions that finish through `workflow_done`.
-- Validation retries stay on the same live agent (`maxValidationAttempts`, default 3).
+- Validation retries stay on the medium (`maxValidationAttempts`, default 3). Herdr re-prompts the live agent; the pi subprocess medium respawns.
 - Agent kind for workflow nodes is Pi (`pi` / `pi-wiz` wrapper). Other kinds need a compatible structured-result tool.
 - Run visibility is pane labels + `workflow` tool progress (no graph widget).

@@ -2,32 +2,28 @@ import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process"
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import type {
+  AgentFinishRequest,
+  AgentMedium,
+  AgentPromptOutcome,
+  AgentPromptRequest,
+  AgentSession,
+  AgentWaitProgress,
+} from "../agent/medium.js";
+import { AgentProtocolExecutor } from "../agent/protocol.js";
+import type {
   AgentStepExecutor,
   AgentStepRequest,
   AgentStepSubmission,
   ResolvedAgentSpawn,
 } from "../workflows/types.js";
-import { preloadSkills, resolveAgentLaunch } from "./agent-defaults.js";
-import type { HerdrAgentWaitProgress } from "./executor.js";
+import type { AgentStartContext, PiInvocation } from "./pi-args.js";
 import {
-  type AgentStartContext,
-  type PiInvocation,
-  buildMissingResultRetryPrompt,
   buildStandalonePiArgs,
-  buildValidationRetryPrompt,
   defaultAgentArgs,
   loadWizEnv,
-  resolveChildExtensionPath,
   resolvePiInvocation,
   workflowChildEnv,
-  writeAgentEnvScript,
 } from "./pi-args.js";
-import {
-  clearResultFile,
-  ensureArtifactDir,
-  readResultFile,
-  writeTaskFile,
-} from "./result-file.js";
 
 export type SpawnProcessFn = (
   command: string,
@@ -35,16 +31,13 @@ export type SpawnProcessFn = (
   options: SpawnOptions,
 ) => ChildProcess;
 
-export type PiProcessExecutorOptions = {
+export type PiProcessMediumOptions = {
   cwd?: string;
   /** Override how the child `pi` is invoked. Defaults to {@link resolvePiInvocation}. */
   resolvePi?: (args: string[]) => PiInvocation;
   spawnProcess?: SpawnProcessFn;
   buildAgentArgs?: (ctx: AgentStartContext) => string[];
-  childExtensionPath?: string;
   completionTimeoutMs?: number;
-  maxValidationAttempts?: number;
-  onProgress?: (event: HerdrAgentWaitProgress) => void;
   /** Orchestrator session file used when spawn.fork is true. */
   forkSessionFile?: string;
   /** Extra `-e` sources appended after spawn.extensions (e.g. a stub model). */
@@ -52,6 +45,12 @@ export type PiProcessExecutorOptions = {
   /** Replace spawn.model for the child (test stub provider). */
   modelOverride?: string;
   env?: NodeJS.ProcessEnv;
+};
+
+export type PiProcessExecutorOptions = PiProcessMediumOptions & {
+  childExtensionPath?: string;
+  maxValidationAttempts?: number;
+  onProgress?: (event: AgentWaitProgress) => void;
 };
 
 export type SpawnLaunchRecord = {
@@ -65,188 +64,78 @@ export type SpawnLaunchRecord = {
 };
 
 /**
- * Runs agent steps as standalone vanilla `pi` child processes.
- *
- * Used when the orchestrator is not inside Herdr. Spawn params map to the same
- * `pi` flags as Herdr's `agent start ... --` payload, plus print-mode flags so
- * the child exits after `workflow_done`.
+ * Vanilla `pi` subprocess medium. Each prompt spawns a print-mode child using
+ * the same flags Herdr would pass after `agent start --`.
  */
-export class PiProcessExecutor implements AgentStepExecutor {
+export class PiProcessMedium implements AgentMedium {
+  readonly delivery = "respawn" as const;
   private readonly cwd?: string;
   private readonly resolvePi: (args: string[]) => PiInvocation;
   private readonly spawnProcess: SpawnProcessFn;
   private readonly buildAgentArgs: (ctx: AgentStartContext) => string[];
-  private readonly childExtensionPath: string;
   private readonly completionTimeoutMs: number;
-  private readonly maxValidationAttempts: number;
-  private readonly onProgress?: (event: HerdrAgentWaitProgress) => void;
   private readonly forkSessionFile?: string;
   private readonly extraChildExtensions: string[];
   private readonly modelOverride?: string;
   private readonly env: NodeJS.ProcessEnv;
+  private currentChild: ChildProcess | null = null;
+  private startContext: AgentStartContext | null = null;
   lastLaunch: SpawnLaunchRecord | null = null;
   launches: SpawnLaunchRecord[] = [];
 
-  constructor(options: PiProcessExecutorOptions = {}) {
+  constructor(options: PiProcessMediumOptions = {}) {
     this.cwd = options.cwd;
     this.resolvePi = options.resolvePi ?? resolvePiInvocation;
     this.spawnProcess = options.spawnProcess ?? spawn;
     this.buildAgentArgs = options.buildAgentArgs ?? defaultAgentArgs;
-    this.childExtensionPath = options.childExtensionPath ?? resolveChildExtensionPath();
     this.completionTimeoutMs = options.completionTimeoutMs ?? 30 * 60_000;
-    this.maxValidationAttempts = Math.max(1, options.maxValidationAttempts ?? 3);
-    this.onProgress = options.onProgress;
     this.forkSessionFile = options.forkSessionFile;
     this.extraChildExtensions = options.extraChildExtensions ?? [];
     this.modelOverride = options.modelOverride;
     this.env = options.env ?? process.env;
   }
 
-  async dispose(): Promise<void> {
-    // No pane/workspace to tear down.
-  }
-
-  async runAgentStep(request: AgentStepRequest, signal: AbortSignal): Promise<AgentStepSubmission> {
-    const { contract } = request;
-    ensureArtifactDir(contract.artifactDir);
-    clearResultFile(contract.resultPath);
-    const launch = resolveAgentLaunch(request.spawn, this.cwd);
-    const spawnConfig = applyStandaloneSpawnOverrides(launch.spawn, {
+  adaptSpawn(spawnConfig: ResolvedAgentSpawn): ResolvedAgentSpawn {
+    return applyStandaloneSpawnOverrides(spawnConfig, {
       extraChildExtensions: this.extraChildExtensions,
       modelOverride: this.modelOverride,
     });
-    const rolePrompt = launch.rolePrompt
-      ? `${launch.rolePrompt}\n\n${request.prompt}`
-      : request.prompt;
-    const prompt = await preloadSkills(
-      rolePrompt,
-      spawnConfig.skills,
-      spawnConfig.cwd ?? this.cwd ?? process.cwd(),
-    );
-    const taskPath = writeTaskFile(contract.artifactDir, prompt);
-    const startContext: AgentStartContext = {
-      spawn: spawnConfig,
-      prompt,
-      contract,
-      taskPath,
-      resultPath: contract.resultPath,
-      artifactDir: contract.artifactDir,
-      childExtensionPath: this.childExtensionPath,
-      ...(launch.thinking ? { thinking: launch.thinking } : {}),
-      ...(launch.replaceSystemPrompt ? { replaceSystemPrompt: launch.replaceSystemPrompt } : {}),
-      appendSystemPrompts: launch.appendSystemPrompts,
-    };
-    writeAgentEnvScript(startContext);
-
-    const agentName = spawnConfig.name;
-    const paneId = "pi-process";
-    this.onProgress?.({
-      phase: "agent_start",
-      paneId,
-      agentName,
-      nodeId: contract.nodeId,
-      spawnName: spawnConfig.name,
-      message: `pi spawn ${agentName} (standalone)`,
-    });
-
-    let nextPrompt = prompt;
-    let nextPromptFile = taskPath;
-    let lastFailure: { kind: "missing_result" | "validation"; message: string } | null = null;
-
-    for (let submission = 1; submission <= this.maxValidationAttempts; submission++) {
-      const retryPhase =
-        lastFailure?.kind === "missing_result"
-          ? "completion_retry"
-          : lastFailure?.kind === "validation"
-            ? "validation_retry"
-            : "agent_prompt";
-      this.onProgress?.({
-        phase: submission === 1 ? "agent_prompt" : retryPhase,
-        paneId,
-        agentName,
-        nodeId: contract.nodeId,
-        spawnName: spawnConfig.name,
-        message:
-          submission === 1
-            ? `pi -p ${agentName}`
-            : lastFailure?.kind === "missing_result"
-              ? `missing workflow_done; respawn ${agentName} (${submission}/${this.maxValidationAttempts})`
-              : `validation rejected; respawn ${agentName} (${submission}/${this.maxValidationAttempts})`,
-        submission,
-        maxSubmissions: this.maxValidationAttempts,
-      });
-
-      if (submission > 1) {
-        nextPromptFile = path.join(contract.artifactDir, `retry-${submission}.md`);
-        writeFileSync(nextPromptFile, nextPrompt, "utf8");
-      }
-
-      clearResultFile(contract.resultPath);
-      const childResult = await this.spawnChild({
-        startContext: { ...startContext, prompt: nextPrompt, taskPath: nextPromptFile },
-        promptFile: nextPromptFile,
-        submission,
-        signal,
-      });
-      if (childResult.killedByAbort) {
-        throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
-      }
-
-      const hasResult = Boolean(readResultFile(contract.resultPath));
-      if (!hasResult) {
-        lastFailure = {
-          kind: "missing_result",
-          message: `Agent ${spawnConfig.name} settled without calling workflow_done (${contract.resultPath})${formatChildFailure(childResult)}`,
-        };
-        if (submission >= this.maxValidationAttempts) break;
-        nextPrompt = buildMissingResultRetryPrompt(submission, this.maxValidationAttempts);
-        continue;
-      }
-
-      const accepted = await this.acceptSubmission(request);
-      if (accepted.ok) {
-        this.onProgress?.({
-          phase: "result",
-          paneId,
-          agentName,
-          nodeId: contract.nodeId,
-          spawnName: spawnConfig.name,
-          message: `workflow_done accepted for ${contract.nodeId}`,
-          submission,
-          maxSubmissions: this.maxValidationAttempts,
-        });
-        return { output: accepted.value };
-      }
-
-      lastFailure = { kind: "validation", message: accepted.error };
-      clearResultFile(contract.resultPath);
-      if (submission >= this.maxValidationAttempts) break;
-      nextPrompt = buildValidationRetryPrompt(
-        accepted.error,
-        submission,
-        this.maxValidationAttempts,
-      );
-    }
-
-    if (lastFailure?.kind === "missing_result") {
-      throw new Error(`${lastFailure.message} after ${this.maxValidationAttempts} submission(s)`);
-    }
-    throw new Error(
-      `Agent output rejected after ${this.maxValidationAttempts} submission(s): ${lastFailure?.message ?? "unknown validation error"}`,
-    );
   }
 
-  private async acceptSubmission(
-    request: AgentStepRequest,
-  ): Promise<{ ok: true; value: unknown } | { ok: false; error: string }> {
-    const result = readResultFile(request.contract.resultPath);
-    if (!result) {
-      return {
-        ok: false,
-        error: `Agent went idle without writing result file at ${request.contract.resultPath}`,
-      };
+  async start(ctx: AgentStartContext, _signal: AbortSignal): Promise<AgentSession> {
+    this.startContext = ctx;
+    this.launches = [];
+    this.lastLaunch = null;
+    return {
+      agentName: ctx.spawn.name,
+      paneId: "pi-process",
+      startMessage: `pi spawn ${ctx.spawn.name}`,
+    };
+  }
+
+  async prompt(_session: AgentSession, request: AgentPromptRequest): Promise<AgentPromptOutcome> {
+    const startContext = this.startContext;
+    if (!startContext) {
+      throw new Error("PiProcessMedium.prompt called before start");
     }
-    return await request.accept(result.output);
+    const childResult = await this.spawnChild({
+      startContext: { ...startContext, prompt: request.prompt, taskPath: request.promptFile },
+      promptFile: request.promptFile,
+      submission: request.submission,
+      signal: request.signal,
+    });
+    if (childResult.killedByAbort) {
+      return { killedByAbort: true, detail: formatChildFailure(childResult) };
+    }
+    return { detail: formatChildFailure(childResult) };
+  }
+
+  interrupt(): void {
+    this.currentChild?.kill("SIGTERM");
+  }
+
+  async finish(_session: AgentSession, _request: AgentFinishRequest): Promise<void> {
+    this.currentChild = null;
   }
 
   private async spawnChild(args: {
@@ -291,6 +180,7 @@ export class PiProcessExecutor implements AgentStepExecutor {
         env: childEnv,
         stdio: ["ignore", "pipe", "pipe"],
       });
+      this.currentChild = child;
       let stdout = "";
       let stderr = "";
       let settled = false;
@@ -312,6 +202,7 @@ export class PiProcessExecutor implements AgentStepExecutor {
       child.on("error", (error) => {
         if (settled) return;
         settled = true;
+        this.currentChild = null;
         clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
         writeChildLogs(startContext.artifactDir, submission, stdout, stderr);
@@ -320,6 +211,7 @@ export class PiProcessExecutor implements AgentStepExecutor {
       child.on("close", (code) => {
         if (settled) return;
         settled = true;
+        this.currentChild = null;
         clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);
         writeChildLogs(startContext.artifactDir, submission, stdout, stderr);
@@ -345,18 +237,53 @@ export class PiProcessExecutor implements AgentStepExecutor {
   }
 }
 
+/**
+ * Agent-step executor that uses a vanilla `pi` subprocess as the medium.
+ */
+export class PiProcessExecutor implements AgentStepExecutor {
+  private readonly medium: PiProcessMedium;
+  private readonly protocol: AgentProtocolExecutor;
+
+  constructor(options: PiProcessExecutorOptions = {}) {
+    this.medium = new PiProcessMedium(options);
+    this.protocol = new AgentProtocolExecutor({
+      medium: this.medium,
+      cwd: options.cwd,
+      childExtensionPath: options.childExtensionPath,
+      maxValidationAttempts: options.maxValidationAttempts,
+      onProgress: options.onProgress,
+    });
+  }
+
+  get lastLaunch(): SpawnLaunchRecord | null {
+    return this.medium.lastLaunch;
+  }
+
+  get launches(): SpawnLaunchRecord[] {
+    return this.medium.launches;
+  }
+
+  async dispose(signal?: AbortSignal): Promise<void> {
+    await this.protocol.dispose(signal);
+  }
+
+  async runAgentStep(request: AgentStepRequest, signal: AbortSignal): Promise<AgentStepSubmission> {
+    return await this.protocol.runAgentStep(request, signal);
+  }
+}
+
 export function applyStandaloneSpawnOverrides(
-  spawn: ResolvedAgentSpawn,
+  spawnConfig: ResolvedAgentSpawn,
   options: { extraChildExtensions: string[]; modelOverride?: string },
 ): ResolvedAgentSpawn {
   const extensions = [
-    ...(spawn.extensions ?? []),
+    ...(spawnConfig.extensions ?? []),
     ...options.extraChildExtensions.filter(
-      (extension) => !(spawn.extensions ?? []).includes(extension),
+      (extension) => !(spawnConfig.extensions ?? []).includes(extension),
     ),
   ];
   return {
-    ...spawn,
+    ...spawnConfig,
     ...(extensions.length > 0 ? { extensions } : {}),
     ...(options.modelOverride ? { model: options.modelOverride } : {}),
   };

@@ -2,7 +2,7 @@
 
 Level 1–8 graphs under `examples/demo/`. File stem = discover / `/workflow` name.
 
-These showcase engine capabilities with increasing complexity. Most levels are compute/shell-only and run without Herdr. Agent levels (04, 08 mid-node) need a live Herdr session or a mocked `AgentStepExecutor` in tests.
+These showcase engine capabilities with increasing complexity. Most levels are compute/shell-only and run without an agent medium. Agent levels (04, 08 mid-node) need a live medium (Herdr or child `pi`) or `MockAgentExecutor` in tests.
 
 | Level | Command | Graph | Shows |
 |---|---|---|---|

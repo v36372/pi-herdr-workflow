@@ -480,8 +480,11 @@ export type AgentStepSubmission = {
 };
 
 /**
- * Runs one agent step to completion. Implementations deliver the prompt to
- * the model and resolve once a submission has been accepted via `accept`.
+ * Runs one agent step to completion. The engine talks only to this surface.
+ *
+ * Production executors wrap an agent medium (Herdr panes, a `pi` subprocess,
+ * or a test mock) with the shared result-file protocol. Tests may implement
+ * this interface directly, or mock the medium and keep retries.
  * Must reject with an `AbortError`-like error when `signal` aborts.
  */
 export interface AgentStepExecutor {

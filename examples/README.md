@@ -59,7 +59,7 @@ From a Herdr session with this package installed:
 /workflow plan-checkpoint one week plan
 ```
 
-Agent demos need Herdr (`HERDR_ENV=1`). Compute/shell-only graphs still go through the `workflow` tool but do not open agent panes.
+Agent demos need a medium (`HERDR_ENV=1` for panes, otherwise child `pi`). Compute/shell-only graphs still go through the `workflow` tool but do not start agents.
 
 ## Cheap model helper
 

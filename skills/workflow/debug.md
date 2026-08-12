@@ -42,11 +42,11 @@ Work from the latest `results[nodeId]` and matching attempt artifacts.
 | `protocol_mismatch` | Herdr CLI/server skew | Upgrade Herdr / this package together |
 | Switch / missing case errors | Edge cases incomplete | Cover every decision choice and every `$result.outcome` you route |
 | `Workflow exceeded maxSteps` | Cycle without exit | Fix edges or raise `maxSteps` only with a clear loop bound |
-| `HERDR_ENV` / not inside Herdr | Orchestrator outside Herdr | Rerun from a Herdr-managed pi session |
+| `HERDR_ENV` / not inside Herdr | Orchestrator using the pi subprocess medium | Expected outside Herdr; agent nodes spawn child `pi`. Use `MockAgentExecutor` in tests. |
 
 ## Validation retries
 
-On reject, the executor clears `result.json` and re-prompts the same live agent with the validation error (default max 3). A stale accepted payload cannot linger.
+On reject, the protocol clears `result.json` and retries (Herdr: same live agent; pi subprocess: new child) with the validation error (default max 3). A stale accepted payload cannot linger.
 
 If retries exhaust: either the model cannot satisfy the contract (clarify `expectedOutput` / prompt evidence) or `validate` is wrong (fix the predicate, keep required fields).
 
