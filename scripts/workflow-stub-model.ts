@@ -190,6 +190,10 @@ export function guessWorkflowOutput(prompt: string): unknown {
   if (picked?.[1]) {
     return { shout: picked[1].toUpperCase() };
   }
+  const related = prompt.match(/Prefer something related to: ([A-Za-z]+)/);
+  if (related?.[1]) {
+    return { word: related[1].toLowerCase() };
+  }
   const listed = prompt.match(/exactly one of:\s*((?:"[^"]+"\s*(?:\||,)\s*)*"[^"]+")/i);
   if (listed?.[1]) {
     const choices = [...listed[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]!);
@@ -209,6 +213,18 @@ export function guessWorkflowOutput(prompt: string): unknown {
 function guessFromExpected(prompt: string): Record<string, unknown> | null {
   const expected = prompt.match(/Expected output:\s*`?(\{[\s\S]*?\})`?/);
   if (!expected?.[1]) return null;
+  try {
+    const parsed: unknown = JSON.parse(expected[1]);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out: Record<string, unknown> = { ...parsed };
+      for (const [key, value] of Object.entries(out)) {
+        if (value === "…" || value === "...") out[key] = "stub";
+      }
+      return out;
+    }
+  } catch {
+    // Example payloads are often illustrative, not strict JSON.
+  }
   const keys = [...expected[1].matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"\s*:/g)].map(
     (match) => match[1]!,
   );

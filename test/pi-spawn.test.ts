@@ -387,6 +387,9 @@ test("stub guessWorkflowOutput covers echo, shout, decision, and reply", () => {
   assert.deepEqual(guessWorkflowOutput("Previous node picked the word: ocean\nuppercased"), {
     shout: "OCEAN",
   });
+  assert.deepEqual(guessWorkflowOutput("Prefer something related to: ocean\nPick a noun"), {
+    word: "ocean",
+  });
   assert.deepEqual(
     guessWorkflowOutput('Answer by picking exactly one of: "heads" | "tails".'),
     { route: "heads", reason: "stub" },
