@@ -40,6 +40,7 @@
   ],
   "scripts": {
     "check:upstream": "bash scripts/check-upstream-workflows.sh",
+    "demo:workflows": "node --import tsx scripts/run-demo-workflows.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
