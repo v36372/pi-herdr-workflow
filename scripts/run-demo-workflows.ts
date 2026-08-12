@@ -77,6 +77,12 @@ export async function hangUntilSignal(signal: AbortSignal): Promise<never> {
 }
 
 export function guessDemoOutput(request: AgentStepRequest): unknown {
+  const blob = `${request.prompt}\n${request.contract.expectedOutput ?? ""}`;
+  const choice = pickClosedChoice(blob);
+  if (choice !== null) {
+    return { route: choice, reason: "demo" };
+  }
+
   const quoted = request.prompt.match(
     /Echo (?:seed |this exact string in the echo field: )"([^"]+)"/,
   );
@@ -89,15 +95,45 @@ export function guessDemoOutput(request: AgentStepRequest): unknown {
     return fromExpected;
   }
 
-  return { echo: "demo" };
+  return { echo: "demo", summary: "ok", ok: true };
 }
 
-export function richerDemoOutput(request: AgentStepRequest, _previousError: string): unknown {
+export function richerDemoOutput(request: AgentStepRequest, previousError: string): unknown {
+  const blob = `${request.prompt}\n${request.contract.expectedOutput ?? ""}`;
+  const choice = pickClosedChoice(blob);
+  if (choice !== null) {
+    return { route: choice, reason: `demo retry after: ${previousError}` };
+  }
+
   const fromExpected = guessFromExpected(request.contract.expectedOutput, { rich: true });
   if (fromExpected !== null) {
+    const quoted = request.prompt.match(
+      /Echo (?:seed |this exact string in the echo field: )"([^"]+)"/,
+    );
+    if (quoted) {
+      fromExpected.echo = quoted[1];
+    }
     return fromExpected;
   }
-  return { echo: "demo" };
+  return { echo: "demo", summary: "ok", ok: true };
+}
+
+function pickClosedChoice(blob: string): string | null {
+  const listed = blob.match(/exactly one of:\s*((?:"[^"]+"\s*(?:\||,)\s*)*"[^"]+")/i);
+  if (listed) {
+    const choices = [...listed[1]!.matchAll(/"([^"]+)"/g)].map((match) => match[1]!);
+    if (choices.length > 0) {
+      if (choices.includes("left")) return "left";
+      return choices[0]!;
+    }
+  }
+  if (/\bleft\b[\s\S]*\bright\b|\bright\b[\s\S]*\bleft\b/i.test(blob)) {
+    return "left";
+  }
+  if (/\bship\b[\s\S]*\bfix\b|\bfix\b[\s\S]*\bship\b/i.test(blob)) {
+    return "ship";
+  }
+  return null;
 }
 
 function guessFromExpected(
