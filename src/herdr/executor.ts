@@ -1,5 +1,4 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
 import type {
@@ -7,10 +6,19 @@ import type {
   AgentStepRequest,
   AgentStepSubmission,
   ResolvedAgentSpawn,
-  WorkflowAgentKind,
 } from "../workflows/types.js";
 import { preloadSkills, resolveAgentLaunch } from "./agent-defaults.js";
 import { HerdrClient, isHerdrError, makeHerdrError } from "./client.js";
+import {
+  type AgentStartContext,
+  buildMissingResultRetryPrompt,
+  buildValidationRetryPrompt,
+  defaultAgentArgs,
+  resolveChildExtensionPath,
+  resolveHerdrKind,
+  shellQuote,
+  writeAgentEnvScript,
+} from "./pi-args.js";
 import {
   clearResultFile,
   ensureArtifactDir,
@@ -18,6 +26,14 @@ import {
   sleep,
   writeTaskFile,
 } from "./result-file.js";
+
+export type { AgentStartContext } from "./pi-args.js";
+export {
+  buildKindBootstrapLines,
+  defaultAgentArgs,
+  isInsideHerdr,
+  resolveHerdrKind,
+} from "./pi-args.js";
 
 /** Explicit ceiling for same-pane validation resubmissions (initial + retries). */
 export const DEFAULT_MAX_VALIDATION_ATTEMPTS = 3;
@@ -61,6 +77,8 @@ export type HerdrStepExecutorOptions = {
   originFocus?: HerdrOriginFocus;
   /** Build native arguments passed after `herdr agent start ... --`. */
   buildAgentArgs?: (ctx: AgentStartContext) => string[];
+  /** Override the child `workflow_done` extension path. */
+  childExtensionPath?: string;
   /**
    * Tear down run-owned layout on dispose: close an owned tab, or an owned
    * fallback workspace. Default false.
@@ -76,20 +94,6 @@ export type HerdrStepExecutorOptions = {
   maxValidationAttempts?: number;
   /** Progress hook for orchestrator tool updates. */
   onProgress?: (event: HerdrAgentWaitProgress) => void;
-};
-
-export type AgentStartContext = {
-  spawn: ResolvedAgentSpawn;
-  prompt: string;
-  contract: AgentStepRequest["contract"];
-  taskPath: string;
-  resultPath: string;
-  artifactDir: string;
-  /** Absolute path to this package's child extension entry. */
-  childExtensionPath: string;
-  thinking?: string;
-  replaceSystemPrompt?: string;
-  appendSystemPrompts: string[];
 };
 
 /**
@@ -138,7 +142,7 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     this.completionTimeoutMs = options.completionTimeoutMs ?? 30 * 60_000;
     this.maxValidationAttempts = Math.max(1, options.maxValidationAttempts ?? DEFAULT_MAX_VALIDATION_ATTEMPTS);
     this.onProgress = options.onProgress;
-    this.childExtensionPath = resolveChildExtensionPath();
+    this.childExtensionPath = options.childExtensionPath ?? resolveChildExtensionPath();
   }
 
   get runWorkspaceId(): string | null {
@@ -594,21 +598,8 @@ export class HerdrStepExecutor implements AgentStepExecutor {
     signal: AbortSignal,
   ): Promise<void> {
     await this.waitForShellReady(paneId, signal);
-    const setupPath = path.join(ctx.artifactDir, "agent-env.sh");
+    const setupPath = writeAgentEnvScript(ctx);
     const marker = `PI_WORKFLOW_ENV_READY_${ctx.contract.attemptId}`;
-    const env = {
-      PI_WORKFLOW_RUN_ID: ctx.contract.runId,
-      PI_WORKFLOW_NODE_ID: ctx.contract.nodeId,
-      PI_WORKFLOW_ATTEMPT_ID: ctx.contract.attemptId,
-      PI_WORKFLOW_RESULT_PATH: ctx.resultPath,
-      PI_WORKFLOW_TASK_PATH: ctx.taskPath,
-      PI_WORKFLOW_ARTIFACT_DIR: ctx.artifactDir,
-    };
-    const lines = [
-      ...Object.entries(env).map(([key, value]) => `export ${key}=${shellQuote(value)}`),
-      ...buildKindBootstrapLines(ctx.spawn.kind),
-    ];
-    writeFileSync(setupPath, `${lines.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
     await this.client.paneRun(
       paneId,
       `source ${shellQuote(setupPath)} && printf '%s\\n' ${shellQuote(marker)}`,
@@ -661,99 +652,6 @@ function resolveOriginFocus(explicit?: HerdrOriginFocus): HerdrOriginFocus {
   };
 }
 
-function buildValidationRetryPrompt(
-  validationError: string,
-  submission: number,
-  maxSubmissions: number,
-): string {
-  return [
-    "Your previous workflow_done submission was rejected by the workflow validator.",
-    `Submission ${submission} of ${maxSubmissions}.`,
-    "",
-    "Validation error:",
-    validationError,
-    "",
-    "Correct the structured output and call workflow_done again with a valid payload.",
-    "Do not reuse the rejected result. result.json was cleared; only a new workflow_done write is authoritative.",
-  ].join("\n");
-}
-
-function buildMissingResultRetryPrompt(
-  submission: number,
-  maxSubmissions: number,
-): string {
-  return [
-    "You settled without calling workflow_done.",
-    `Submission ${submission} of ${maxSubmissions}.`,
-    "",
-    "This step is incomplete until workflow_done accepts structured output.",
-    "Call workflow_done now with the best available result.",
-    "If evidence is incomplete, still submit: use status=\"inconclusive\" (or ok=false when that is the schema) and list evidenceGaps.",
-    "Do not keep investigating past this reminder unless one bounded probe is required to fill a required field.",
-  ].join("\n");
-}
-
-/**
- * Map workflow spawn.kind → Herdr `--kind`.
- * Herdr only accepts a fixed agent enum; `pi-wiz` is a pi wrapper with env bootstrap.
- */
-export function resolveHerdrKind(kind: WorkflowAgentKind | undefined): "pi" {
-  if (kind === undefined || kind === "pi" || kind === "pi-wiz") {
-    return "pi";
-  }
-  // Exhaustiveness guard if WorkflowAgentKind grows without executor support.
-  const _exhaustive: never = kind;
-  throw new Error(`Unsupported workflow agent kind: ${String(_exhaustive)}`);
-}
-
-/** Shell lines sourced before agent start for kind-specific env bootstrap. */
-export function buildKindBootstrapLines(kind: WorkflowAgentKind | undefined): string[] {
-  if (kind !== "pi-wiz") {
-    return [];
-  }
-  // Mirrors zsh alias: pi-wiz='source "$HOME/.config/wiz-mcp/env.zsh" && pi'
-  const wizEnv = path.join(os.homedir(), ".config", "wiz-mcp", "env.zsh");
-  return [
-    "# workflow spawn.kind=pi-wiz → load Wiz MCP credentials (same as shell alias pi-wiz)",
-    `if [ -f ${shellQuote(wizEnv)} ]; then`,
-    "  set -a",
-    `  . ${shellQuote(wizEnv)}`,
-    "  set +a",
-    "fi",
-  ];
-}
-
-/** Package source accepted by `pi -e` (resolved via package-manager, incl. git URLs). */
-const PI_MCP_ADAPTER_SOURCE = "https://github.com/nicobailon/pi-mcp-adapter";
-
-function defaultAgentArgs(ctx: AgentStartContext): string[] {
-  // -ne disables settings discovery; explicit -e still loads (local path OR
-  // package source: npm:/git:/https://github.com/...). Package sources are
-  // resolved by PackageManager.resolveExtensionSources({ temporary: true }).
-  const args = ["--no-session", "-ne", "-e", ctx.childExtensionPath];
-  for (const extension of ctx.spawn.extensions ?? []) {
-    args.push("-e", extension);
-  }
-  if (ctx.spawn.kind === "pi-wiz") {
-    // Wiz MCP needs the mcp tool from pi-mcp-adapter.
-    args.push("-e", PI_MCP_ADAPTER_SOURCE);
-  }
-  if (ctx.spawn.model) args.push("--model", ctx.spawn.model);
-  if (ctx.thinking) args.push("--thinking", ctx.thinking);
-  if (ctx.replaceSystemPrompt) {
-    args.push("--system-prompt", ctx.replaceSystemPrompt);
-  }
-  for (const systemPrompt of ctx.appendSystemPrompts) {
-    args.push("--append-system-prompt", systemPrompt);
-  }
-  if (ctx.spawn.tools) {
-    const tools = new Set(ctx.spawn.tools.split(",").map((tool) => tool.trim()).filter(Boolean));
-    tools.add("workflow_done");
-    args.push("--tools", [...tools].join(","));
-  }
-  return args;
-}
-
 function liveAgentName(label: string, attemptId: string): string {
   const suffix = attemptId.toLowerCase().replaceAll(/[^a-z0-9]/g, "").slice(0, 8);
   let base = label.toLowerCase().replaceAll(/[^a-z0-9_-]+/g, "-").replaceAll(/(^-+|-+$)/g, "");
@@ -761,15 +659,6 @@ function liveAgentName(label: string, attemptId: string): string {
   const maxBaseLength = 32 - suffix.length - 1;
   base = base.slice(0, maxBaseLength).replace(/-+$/, "") || "agent";
   return `${base}-${suffix}`;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-function resolveChildExtensionPath(): string {
-  // src/herdr/executor.ts → src/child/extension.ts
-  return path.resolve(path.dirname(new URL(import.meta.url).pathname), "../child/extension.ts");
 }
 
 /** Test helper: write a fake successful result as a child would. */

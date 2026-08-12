@@ -102,13 +102,39 @@ pi install file:./pi-herdr-workflows
 # or from this directory after npm i
 ```
 
-Requires: pi ≥ 0.80 and Herdr ≥ 0.7.5 on PATH, with pi running inside a Herdr session.
+Requires: pi ≥ 0.80. Agent panes need Herdr ≥ 0.7.5 on PATH with pi running inside a Herdr session. Compute/shell/checkpoint graphs also run on standalone vanilla pi.
 
 ```bash
 /workflow                 # float menu: pick workflow, optional agent models, optional task
 /workflow list
 /workflow echo summarize this repo
 /workflow pause | resume | cancel
+```
+
+### Standalone vanilla pi (no Herdr)
+
+Load this package with `--extension` / `-e` instead of installing it into settings:
+
+```bash
+pi --no-extensions --extension ./src/extension/index.ts
+```
+
+Print mode runs the graph inside the `/workflow` command, so compute/shell examples do not need a configured model:
+
+```bash
+pi -p --no-session --no-extensions --extension ./src/extension/index.ts \
+  "/workflow examples/hello.workflow.ts --input-json {\"name\":\"tin\"}"
+```
+
+Outside Herdr, agent nodes spawn child `pi` processes using the same spawn flags Herdr would pass after `agent start --` (`-ne`, `-e` child extension, `--model`, `--thinking`, `--tools`, extra `-e` from `spawn.extensions`, `cwd`, `kind`). `spawn.interactive` and `spawn.closePaneAfterDone` are pane controls and are ignored for subprocess children. `spawn.fork` maps to `pi --fork` and needs a persisted parent session (not `--no-session`).
+
+Without provider credentials, point children at the bundled stub model:
+
+```bash
+PI_WORKFLOW_STUB_EXTENSION=./scripts/workflow-stub-model.ts \
+PI_WORKFLOW_STUB_MODEL=workflow-stub/echo \
+pi -p --no-session --no-extensions --extension ./src/extension/index.ts \
+  "/workflow examples/demo/04-spawn-matrix.workflow.ts --input-json {\"echo\":\"ping\"}"
 ```
 
 Bare `/workflow` opens float menus: pick a discovered workflow, then a **custom overlay** listing every agent step. In the list, `j`/`k` (or ↑/↓) move, Enter edits a step, and `q`/Esc accepts the current configuration and exits. While editing, typing filters autocomplete suggestions from Pi's configured scoped models, ↑/↓ or Ctrl-j/k chooses, Tab completes, Enter applies, and Esc cancels that edit while keeping its previous override/default. Steps without an authored model show Pi's effective configured `provider/id` instead of a generic workflow-default label. Empty or invalid input keeps the step's default. Overrides are passed as `modelOverrides` into the `workflow` tool.

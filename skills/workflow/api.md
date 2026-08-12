@@ -38,9 +38,10 @@ Same surface as interactive-subagents `subagent()`, minus mux tools. Set on `age
 | `tools` | Comma-separated native tools. Executor always adds `workflow_done`. |
 | `cwd` | Child working directory. String or ctx callback. |
 | `kind` | `pi` (default) or `pi-wiz` (Wiz MCP env + `pi-mcp-adapter`; Herdr kind still `pi`). |
-| `fork` | Full-context fork of the orchestrator session. |
-| `interactive` | Long waits are collaborative, not stalls. |
-| `closePaneAfterDone` | Close the pane after accepted `workflow_done` (default leave open). |
+| `fork` | Full-context fork of the orchestrator session (`pi --fork`). Standalone spawn requires a persisted parent session. |
+| `interactive` | Herdr: long waits are collaborative, not stalls. Ignored for standalone subprocess children. |
+| `closePaneAfterDone` | Herdr: close the pane after accepted `workflow_done` (default leave open). Ignored for standalone subprocess children. |
+| `extensions` | Extra `pi -e` sources on the child. Settings discovery stays disabled (`-ne`). |
 
 Named-agent markdown may set `model`, `thinking`, `tools`, `skill`/`skills`, `cwd`, and `system-prompt: append|replace`. Explicit spawn fields win. Unknown agent or skill fails the node before Pi starts.
 
@@ -104,9 +105,11 @@ Child extension registers `workflow_done`, writes `result.json`, returns `termin
 ## Library use (no `/workflow`)
 
 ```ts
-import { WorkflowEngine, HerdrStepExecutor } from "pi-herdr-workflows";
+import { WorkflowEngine, HerdrStepExecutor, PiProcessExecutor } from "pi-herdr-workflows";
 
-const executor = new HerdrStepExecutor({ cwd: process.cwd() });
+const executor = process.env.HERDR_ENV === "1"
+  ? new HerdrStepExecutor({ cwd: process.cwd() })
+  : new PiProcessExecutor({ cwd: process.cwd() });
 const engine = new WorkflowEngine({ executor });
 const result = await engine.run(myWorkflow, { task: "…" });
 await executor.dispose();

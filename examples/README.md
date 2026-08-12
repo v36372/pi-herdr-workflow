@@ -31,6 +31,15 @@ npm run demo:workflows
 npm test   # includes test/demo-workflows.test.ts
 ```
 
+Standalone vanilla pi (no Herdr) can run the same files through `/workflow` after loading the extension with `--extension`:
+
+```bash
+pi -p --no-session --no-extensions --extension ./src/extension/index.ts \
+  "/workflow examples/hello.workflow.ts"
+```
+
+Agent examples need a model, or the stub provider in `scripts/workflow-stub-model.ts` (see README).
+
 ## Run
 
 From a Herdr session with this package installed:

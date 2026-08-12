@@ -11,6 +11,17 @@ export type {
   HerdrStepExecutorOptions,
   AgentStartContext,
 } from "./herdr/executor.js";
+export {
+  PiProcessExecutor,
+  applyStandaloneSpawnOverrides,
+} from "./herdr/pi-spawn.js";
+export type { PiProcessExecutorOptions, SpawnLaunchRecord } from "./herdr/pi-spawn.js";
+export {
+  buildStandalonePiArgs,
+  defaultAgentArgs,
+  isInsideHerdr,
+  resolvePiInvocation,
+} from "./herdr/pi-args.js";
 /** Vendored interactive tools from @ogulcancelik/pi-herdr (herdr_layout/pane/agent). */
 export { default as registerHerdrTool } from "./herdr/tool.js";
 export {
