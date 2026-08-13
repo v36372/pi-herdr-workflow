@@ -5,7 +5,7 @@ description: "Workflow graphs for pi-herdr-workflows. Use when authoring a .work
 
 # Workflow
 
-A **workflow** is a deterministic graph the orchestrator walks once via the `workflow` tool. Agent nodes **spawn** into Herdr panes; compute / shell / checkpoint stay in-process. Agents finish through a **contract**: `expectedOutput` + `validate` + `workflow_done` → `result.json`.
+A **workflow** is a deterministic graph the orchestrator walks once via the `workflow` tool. Agent nodes spawn through an **agent medium** (Herdr panes, a `pi` subprocess, or a test mock); compute / shell / checkpoint stay in-process. Agents finish through a **contract**: `expectedOutput` + `validate` + `workflow_done` → `result.json`.
 
 Field-level API, recipes, and run-bundle forensics live behind the pointers below — load them when that step needs them.
 
@@ -65,7 +65,7 @@ Plain `{ from, to }`, `decisionEdge(...)`, or `$result.outcome` for repair. At m
 
 Default-export `defineWorkflow({...})` from `.pi/workflows/<name>.workflow.ts` (or this package's `examples/` for demos). Import builders from `pi-herdr-workflows`.
 
-Smoke with `/workflow <name>` inside Herdr (`HERDR_ENV=1`). On validation rejects, tighten prompt or evidence — keep `validate` honest.
+Smoke with `/workflow <name>` (Herdr panes when `HERDR_ENV=1`, otherwise a child `pi`). On validation rejects, tighten prompt or evidence — keep `validate` honest.
 
 **Done when:** a run reaches the intended terminal status (`completed`, intentional `waiting`, or the designed repair path) and `state.json` matches the step-1 shapes.
 

@@ -5,6 +5,7 @@ import {
   truncateHead,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { existsSync, statSync } from "node:fs";
@@ -22,6 +23,8 @@ import {
   type WorkflowTraceEvent,
 } from "../workflows/index.js";
 import { HerdrStepExecutor, type HerdrAgentWaitProgress } from "../herdr/executor.js";
+import { isInsideHerdr } from "../herdr/pi-args.js";
+import { PiProcessExecutor } from "../herdr/pi-spawn.js";
 import registerHerdrTool from "../herdr/tool.js";
 import {
   applyModelOverrides,
@@ -69,14 +72,14 @@ export default function (pi: ExtensionAPI) {
   registerHerdrTool(pi);
 
   let activeEngine: WorkflowEngine | null = null;
-  let activeExecutor: HerdrStepExecutor | null = null;
+  let activeExecutor: HerdrStepExecutor | PiProcessExecutor | null = null;
   let running = false;
 
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
     description:
-      "Run one deterministic pi-herdr-workflows definition. The tool follows the workflow graph, starts each agent node with Herdr 0.7.5's live-agent facade, waits for lifecycle signals, and streams progress until the run settles.",
+      "Run one deterministic pi-herdr-workflows definition. The tool follows the workflow graph, dispatches agent nodes through Herdr panes when inside Herdr or as standalone vanilla pi children otherwise, waits for workflow_done, and streams progress until the run settles.",
     promptSnippet: "Run a deterministic workflow through Herdr agents and wait for completion",
     promptGuidelines: [
       "Use the workflow tool exactly once when a /workflow request asks you to run a named workflow; do not manually execute its nodes.",
@@ -94,9 +97,6 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_PANE_ID) {
-        throw new Error("Workflow agent nodes require pi to run inside Herdr (HERDR_ENV=1).");
-      }
       if (running) throw new Error("A workflow is already running.");
 
       const resolved = await resolveWorkflowRef(params.name, { cwd: ctx.cwd });
@@ -163,20 +163,7 @@ export default function (pi: ExtensionAPI) {
         });
       };
 
-      activeExecutor = new HerdrStepExecutor({
-        cwd: ctx.cwd,
-        // Capture the orchestrator location before any agent step can steal focus.
-        // Closing the run workspace without restoring first can land Herdr on an
-        // unrelated empty workspace.
-        originFocus: {
-          ...(process.env.HERDR_WORKSPACE_ID
-            ? { workspaceId: process.env.HERDR_WORKSPACE_ID }
-            : {}),
-          ...(process.env.HERDR_TAB_ID ? { tabId: process.env.HERDR_TAB_ID } : {}),
-        },
-        closeWorkspaceOnDispose: true,
-        onProgress: onAgentProgress,
-      });
+      activeExecutor = createAgentExecutor(ctx, onAgentProgress);
       activeEngine = new WorkflowEngine({ executor: activeExecutor, onEvent: onTrace });
       running = true;
       const onAbort = () => activeEngine?.cancel();
@@ -286,7 +273,8 @@ export default function (pi: ExtensionAPI) {
         const mtime = existsSync(EXTENSION_FILE)
           ? statSync(EXTENSION_FILE).mtime.toISOString()
           : "?";
-        ctx.ui.notify(
+        reportCommandOutput(
+          ctx,
           [
             `pi-herdr-workflows launch ${LAUNCH_UX_VERSION}`,
             `extension: ${EXTENSION_FILE}`,
@@ -326,6 +314,19 @@ export default function (pi: ExtensionAPI) {
         await resolveWorkflowRef(invocation.name, { cwd: ctx.cwd });
       } catch (error) {
         ctx.ui.notify(String(error), "error");
+        return;
+      }
+
+      if (shouldRunWorkflowInCommand(ctx)) {
+        running = true;
+        try {
+          const result = await executeWorkflowFromCommand(invocation, ctx);
+          reportCommandOutput(ctx, result, "info");
+        } catch (error) {
+          reportCommandOutput(ctx, String(error), "error");
+        } finally {
+          running = false;
+        }
         return;
       }
 
@@ -495,7 +496,7 @@ function findDiscoveredWorkflow(
   return found.find((item) => item.name === name);
 }
 
-function parseInvocation(raw: string): { name: string; input: unknown } {
+function parseInvocation(raw: string): { name: string; input: unknown; modelOverrides?: WorkflowModelOverrides } {
   const match = raw.match(/^(.*?)\s+--input-json\s+([\s\S]+)$/);
   if (match) {
     return { name: match[1]!.trim(), input: JSON.parse(match[2]!) };
@@ -504,6 +505,117 @@ function parseInvocation(raw: string): { name: string; input: unknown } {
   const name = space === -1 ? raw : raw.slice(0, space);
   const task = space === -1 ? "" : raw.slice(space + 1).trim();
   return { name, input: task ? { task } : {} };
+}
+
+function shouldRunWorkflowInCommand(ctx: ExtensionCommandContext): boolean {
+  if (ctx.mode === "print" || ctx.mode === "json") return true;
+  return ctx.model == null;
+}
+
+function reportCommandOutput(
+  ctx: ExtensionCommandContext,
+  text: string,
+  type: "info" | "warning" | "error",
+): void {
+  if (ctx.mode === "print") {
+    if (type === "error") console.error(text);
+    else console.log(text);
+    return;
+  }
+  if (ctx.mode === "json") {
+    console.error(text);
+    return;
+  }
+  ctx.ui.notify(text, type);
+}
+
+function createAgentExecutor(
+  ctx: ExtensionContext,
+  onProgress: (event: HerdrAgentWaitProgress) => void,
+): HerdrStepExecutor | PiProcessExecutor {
+  if (isInsideHerdr()) {
+    return new HerdrStepExecutor({
+      cwd: ctx.cwd,
+      originFocus: {
+        ...(process.env.HERDR_WORKSPACE_ID
+          ? { workspaceId: process.env.HERDR_WORKSPACE_ID }
+          : {}),
+        ...(process.env.HERDR_TAB_ID ? { tabId: process.env.HERDR_TAB_ID } : {}),
+      },
+      closeWorkspaceOnDispose: true,
+      onProgress,
+    });
+  }
+
+  const extraChildExtensions = (process.env.PI_WORKFLOW_STUB_EXTENSION ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const modelOverride = process.env.PI_WORKFLOW_STUB_MODEL?.trim();
+  return new PiProcessExecutor({
+    cwd: ctx.cwd,
+    onProgress,
+    ...(ctx.sessionManager.getSessionFile()
+      ? { forkSessionFile: ctx.sessionManager.getSessionFile() }
+      : {}),
+    extraChildExtensions,
+    ...(modelOverride ? { modelOverride } : {}),
+  });
+}
+
+async function executeWorkflowFromCommand(
+  invocation: WorkflowLaunchInvocation,
+  ctx: ExtensionCommandContext,
+): Promise<string> {
+  const resolved = await resolveWorkflowRef(invocation.name, { cwd: ctx.cwd });
+  const loaded = await loadWorkflowFile(resolved.path);
+  const workflow = applyModelOverrides(loaded, invocation.modelOverrides);
+  const startedAt = Date.now();
+  const executor = createAgentExecutor(ctx, () => undefined);
+  const engine = new WorkflowEngine({ executor });
+  try {
+    const result = await engine.run(workflow, invocation.input ?? null, {
+      workflowPath: path.resolve(resolved.path),
+    });
+    const presentationPrompt = await resolvePresentationPrompt(
+      workflow,
+      result.state,
+      new AbortController().signal,
+    );
+    const phase =
+      result.state.status === "completed"
+        ? "completed"
+        : result.state.status === "waiting"
+          ? "waiting"
+          : "failed";
+    const details: WorkflowToolDetails = {
+      phase,
+      workflowName: workflow.name,
+      message: `Workflow ${workflow.name} ${result.state.status}`,
+      elapsedMs: Date.now() - startedAt,
+      status: result.state.status,
+      runId: result.state.runId,
+      runDir: result.runDir,
+      outputs: result.state.outputs,
+      finalOutput: result.state.finalOutput,
+      completedSteps: result.state.steps.length,
+      currentNodeId: result.state.currentNode ?? result.state.waitingOn,
+      nodes: buildNodeProgress({ workflow, state: result.state, phase }),
+      ...(presentationPrompt ? { presentationPrompt } : {}),
+    };
+    if (
+      result.state.status === "failed" ||
+      result.state.status === "timed_out" ||
+      result.state.status === "cancelled"
+    ) {
+      throw new Error(
+        `${details.message}${result.state.error ? `: ${result.state.error}` : ""}\nrunDir: ${result.runDir}`,
+      );
+    }
+    return formatFinalResult(details);
+  } finally {
+    await executor.dispose();
+  }
 }
 
 function traceProgress(

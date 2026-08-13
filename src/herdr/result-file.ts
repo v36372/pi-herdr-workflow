@@ -16,8 +16,8 @@ import { Effect, FileSystem } from "effect";
  * - `task.md`      — full prompt delivered to the child
  * - `agent-env.sh` — environment sourced into the pane shell before agent start
  *
- * Engine owns routing/validation. Herdr delivers prompts into panes and waits
- * on agent lifecycle signals; `result.json` is the authoritative payload.
+ * Engine owns routing/validation. An agent medium delivers prompts and waits
+ * until the child settles; `result.json` is the authoritative payload.
  *
  * Sync helpers use node:fs (Node FileSystem is async and cannot run under
  * Effect.runSync). Effect helpers use `effect/FileSystem` for Effect programs.
@@ -127,6 +127,22 @@ export const clearResultFileEffect = (
     if (!exists) return;
     yield* fs.remove(resultPath);
   }).pipe(Effect.orDie);
+
+/** Test helper: write a fake successful result as a child `workflow_done` would. */
+export function writeFakeAgentResult(args: {
+  resultPath: string;
+  runId: string;
+  nodeId: string;
+  attemptId: string;
+  output: unknown;
+}): void {
+  writeResultFile(args.resultPath, {
+    runId: args.runId,
+    nodeId: args.nodeId,
+    attemptId: args.attemptId,
+    output: args.output,
+  });
+}
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {

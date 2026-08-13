@@ -1,7 +1,24 @@
 export * from "./workflows/index.js";
+export {
+  AgentProtocolExecutor,
+  MockAgentExecutor,
+  MockAgentMedium,
+} from "./agent/index.js";
+export type {
+  AgentFinishRequest,
+  AgentMedium,
+  AgentPromptOutcome,
+  AgentPromptRequest,
+  AgentProtocolExecutorOptions,
+  AgentSession,
+  AgentWaitProgress,
+  MockAgentHandler,
+  MockAgentTurn,
+} from "./agent/index.js";
 export { HerdrClient, HerdrError, isHerdrError, makeHerdrError } from "./herdr/client.js";
 export {
   DEFAULT_MAX_VALIDATION_ATTEMPTS,
+  HerdrMedium,
   HerdrStepExecutor,
   writeFakeAgentResult,
 } from "./herdr/executor.js";
@@ -11,6 +28,22 @@ export type {
   HerdrStepExecutorOptions,
   AgentStartContext,
 } from "./herdr/executor.js";
+export {
+  PiProcessExecutor,
+  PiProcessMedium,
+  applyStandaloneSpawnOverrides,
+} from "./herdr/pi-spawn.js";
+export type {
+  PiProcessExecutorOptions,
+  PiProcessMediumOptions,
+  SpawnLaunchRecord,
+} from "./herdr/pi-spawn.js";
+export {
+  buildStandalonePiArgs,
+  defaultAgentArgs,
+  isInsideHerdr,
+  resolvePiInvocation,
+} from "./herdr/pi-args.js";
 /** Vendored interactive tools from @ogulcancelik/pi-herdr (herdr_layout/pane/agent). */
 export { default as registerHerdrTool } from "./herdr/tool.js";
 export {

@@ -10,12 +10,16 @@ One package that composes three ideas:
 
 ## What runs where
 
-| Node | Runtime |
+| Layer | Role |
 |---|---|
-| `agent` / `decision` | **Herdr pane** (one pane per attempt, workspace per run) |
-| `compute` / `action` / `shell` / `checkpoint` | **Orchestrator process** (main pi) |
+| Engine | Graph, edges, contracts, `validate`, run bundles |
+| Agent protocol | Skills, `task.md`, `agent-env.sh`, `result.json`, retries |
+| Agent medium | Start the child, deliver a prompt, wait until it settles |
+| `compute` / `action` / `shell` / `checkpoint` | Orchestrator process (no medium) |
 
-Edge routing and validation stay in the engine. Herdr delivers prompts into panes and reports when the agent goes idle; the orchestrator then reads `result.json`.
+Herdr is one medium (panes). A vanilla `pi` subprocess is another. Tests mock the medium and keep the protocol.
+
+Edge routing and validation stay in the engine. The medium reports when the child has settled; the protocol then reads `result.json`.
 
 ## Agent spawn params
 
@@ -67,7 +71,9 @@ register its provider under `-ne`.
 
 `/workflow <name>` sends a normal user turn instructing the main pi orchestrator to call the model-visible `workflow` tool. That tool executes the graph deterministically, stays pending for the whole run, and streams node/agent progress through tool updates. The orchestrator receives the final structured result and presents it after the tool returns.
 
-Agent nodes use Herdr **v0.7.5's live-agent facade**. `workflow_done` → `result.json` remains authoritative; the agent lifecycle is the server-owned wait signal.
+Agent nodes go through `AgentProtocolExecutor` plus an `AgentMedium`. `workflow_done` → `result.json` is authoritative. The medium only starts the child and waits until it settles.
+
+**Herdr medium** (inside a Herdr session, `HERDR_ENV=1`):
 
 | Step | action |
 |---|---|
@@ -76,24 +82,27 @@ Agent nodes use Herdr **v0.7.5's live-agent facade**. `workflow_done` → `resul
 | prepare child environment | source `agent-env.sh` in the pane shell |
 | start interactive child | `herdr agent start <name> --kind pi --pane <id> -- <pi args>` |
 | deliver and wait | `herdr agent prompt <name> <task> --wait` |
-| collect output | accept `result.json` from `workflow_done` |
-| update orchestrator | partial `workflow` tool results with elapsed time and current node |
+| collect output | protocol accepts `result.json` from `workflow_done` |
+
+**Pi subprocess medium** (vanilla pi, no Herdr): spawn `pi -p` with the same flags Herdr would pass after `agent start --`. `spawn.interactive` and `spawn.closePaneAfterDone` are pane controls and are ignored. `spawn.fork` maps to `pi --fork` and needs a persisted parent session.
+
+**Mock medium** (tests): record spawn/prompt and write `result.json` in-process. Retries still run.
 
 Per agent attempt under `~/.pi/agent/workflows/runs/<runId>/agents/<nodeId>/<attemptId>/`:
 
 | File | Writer | Purpose |
 |---|---|---|
-| `task.md` | orchestrator | exact submitted prompt, including agent role and preloaded skills |
+| `task.md` | protocol | exact submitted prompt, including agent role and preloaded skills |
 | `result.json` | child (`workflow_done`) | structured output |
-| `agent-env.sh` | orchestrator | environment inherited by the interactive child |
+| `agent-env.sh` | protocol | environment inherited by the child |
 
-The child extension registers `workflow_done`, writes `result.json`, and returns a terminating tool result so pi settles. `herdr agent prompt --wait` then wakes the orchestrator. No exit-sidecar handshake or status polling is used.
+The child extension registers `workflow_done`, writes `result.json`, and returns a terminating tool result so pi settles. The medium then wakes the protocol. No exit-sidecar handshake or status polling is used.
 
 ## Run bundles
 
 The workflow core tracks upstream `pi-workflows` v0.3.0 (selective graft: park/resume, checkpoint continuation, functional `timeoutMs`). Every run writes a private `0700` bundle with an append-only trace, atomic state and manifest projections, a serializable workflow snapshot, and content-addressed artifacts for strings larger than 4096 bytes. Files are `0600`.
 
-The trace is the workflow replay source of truth. Herdr attempt files remain separate under `agents/<node>/<attempt>/` because they are the live child protocol, not deduplicated run data. Full Pi session-event replay is not exposed yet because child conversations occur in separate Herdr panes. See [`docs/upstream-sync.md`](docs/upstream-sync.md) for the pinned revision and sync boundary.
+The trace is the workflow replay source of truth. Attempt files remain separate under `agents/<node>/<attempt>/` because they are the live child protocol, not deduplicated run data. Full Pi session-event replay is not exposed yet because child conversations occur in a medium (Herdr pane or subprocess). See [`docs/upstream-sync.md`](docs/upstream-sync.md) for the pinned revision and sync boundary.
 
 ## Install
 
@@ -102,13 +111,39 @@ pi install file:./pi-herdr-workflows
 # or from this directory after npm i
 ```
 
-Requires: pi ≥ 0.80 and Herdr ≥ 0.7.5 on PATH, with pi running inside a Herdr session.
+Requires: pi ≥ 0.80. Agent panes need Herdr ≥ 0.7.5 on PATH with pi running inside a Herdr session. Outside Herdr, agent nodes use the pi subprocess medium. Compute/shell/checkpoint graphs never need a medium. Tests mock `AgentMedium` (or inject a fake `HerdrClient`).
 
 ```bash
 /workflow                 # float menu: pick workflow, optional agent models, optional task
 /workflow list
 /workflow echo summarize this repo
 /workflow pause | resume | cancel
+```
+
+### Vanilla pi (no Herdr)
+
+The extension picks a medium from the host: Herdr panes when `HERDR_ENV=1`, otherwise a child `pi` process. Load this package with `--extension` / `-e` instead of installing it into settings:
+
+```bash
+pi --no-extensions --extension ./src/extension/index.ts
+```
+
+Print mode runs the graph inside the `/workflow` command, so compute/shell examples do not need a configured model:
+
+```bash
+pi -p --no-session --no-extensions --extension ./src/extension/index.ts \
+  "/workflow examples/hello.workflow.ts --input-json {\"name\":\"tin\"}"
+```
+
+Outside Herdr, agent nodes spawn child `pi` processes using the same spawn flags Herdr would pass after `agent start --` (`-ne`, `-e` child extension, `--model`, `--thinking`, `--tools`, extra `-e` from `spawn.extensions`, `cwd`, `kind`). `spawn.interactive` and `spawn.closePaneAfterDone` are pane controls and are ignored for subprocess children. `spawn.fork` maps to `pi --fork` and needs a persisted parent session (not `--no-session`).
+
+Without provider credentials, point children at the bundled stub model:
+
+```bash
+PI_WORKFLOW_STUB_EXTENSION=./scripts/workflow-stub-model.ts \
+PI_WORKFLOW_STUB_MODEL=workflow-stub/echo \
+pi -p --no-session --no-extensions --extension ./src/extension/index.ts \
+  "/workflow examples/demo/04-spawn-matrix.workflow.ts --input-json {\"echo\":\"ping\"}"
 ```
 
 Bare `/workflow` opens float menus: pick a discovered workflow, then a **custom overlay** listing every agent step. In the list, `j`/`k` (or ↑/↓) move, Enter edits a step, and `q`/Esc accepts the current configuration and exits. While editing, typing filters autocomplete suggestions from Pi's configured scoped models, ↑/↓ or Ctrl-j/k chooses, Tab completes, Enter applies, and Esc cancels that edit while keeping its previous override/default. Steps without an authored model show Pi's effective configured `provider/id` instead of a generic workflow-default label. Empty or invalid input keeps the step's default. Overrides are passed as `modelOverrides` into the `workflow` tool.
@@ -149,15 +184,28 @@ export default defineWorkflow({
 ## Library use (no pi extension)
 
 ```ts
-import { WorkflowEngine, defineWorkflow, agent, HerdrStepExecutor } from "pi-herdr-workflows";
+import {
+  WorkflowEngine,
+  HerdrStepExecutor,
+  PiProcessExecutor,
+  MockAgentExecutor,
+} from "pi-herdr-workflows";
 
-const executor = new HerdrStepExecutor({ cwd: process.cwd() });
+const executor = process.env.HERDR_ENV === "1"
+  ? new HerdrStepExecutor({ cwd: process.cwd() })
+  : new PiProcessExecutor({ cwd: process.cwd() });
 const engine = new WorkflowEngine({ executor });
 const result = await engine.run(myWorkflow, { task: "…" });
 await executor.dispose();
 ```
 
-Inject a fake `HerdrClient` via `new HerdrClient({ exec })` for tests. CLI failures surface as typed `HerdrError` values with machine-readable `code` fields (`protocol_mismatch`, `agent_prompt_stalled`, `agent_not_running`, …).
+For tests, mock the medium so the protocol (retries, `result.json`) still runs:
+
+```ts
+const executor = new MockAgentExecutor(({ prompt }) => ({ echo: "pong" }));
+```
+
+To exercise Herdr CLI mapping, inject `new HerdrClient({ exec })`. CLI failures surface as typed `HerdrError` values with machine-readable `code` fields (`protocol_mismatch`, `agent_prompt_stalled`, `agent_not_running`, …).
 
 ## Herdr tool ownership
 
@@ -173,12 +221,12 @@ Disable a separate install so you do not register the same tools twice:
 mv ~/.pi/agent/extensions/pi-herdr ~/.pi/agent/extensions/pi-herdr.disabled
 ```
 
-The deterministic `workflow` tool uses `HerdrClient` / `HerdrStepExecutor` and owns its run topology and lifecycle internally. Freeform pane and agent work goes through the three interactive tools above.
+The deterministic `workflow` tool picks a medium (Herdr panes or a `pi` subprocess) and runs the shared agent protocol. Freeform pane and agent work goes through the three interactive tools above.
 
 ## Deliberate ceilings
 
 1. **Workflow-owned lifecycle** — agent frontmatter fields for subagent spawning, session mode, auto-exit, and interactivity do not apply. Workflow agents are fresh ephemeral Pi sessions and must finish through `workflow_done`.
-2. **Bounded completion retry** — if the agent settles without `workflow_done`, or `validate` rejects after `workflow_done`, the same live agent is re-prompted (missing-result reminder or validation error). Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
+2. **Bounded completion retry** — if the agent settles without `workflow_done`, or `validate` rejects after `workflow_done`, the protocol retries (missing-result reminder or validation error). Herdr re-prompts the same live agent; the pi subprocess medium respawns a child. Default ceiling is 3 submissions (`maxValidationAttempts`); rejected `result.json` files are cleared so a stale payload cannot be accepted again.
 3. **No graph widget / temporal session viewer** — workflow replay bundles write to disk, but the upstream Pi recorder would not capture Herdr child sessions. Use `state.json` / `trace.ndjson`; add a Herdr-aware recorder before exposing temporal replay.
 4. **Agent kind** — workflow nodes currently start interactive pi agents. Override `buildAgentArgs` for pi arguments; supporting other agent kinds requires a compatible structured-result tool.
 5. **No `agent.view.*` / metadata-token integration** — Herdr 0.7.5 exposes `agent.view.set`/`agent.view.clear` only on the socket API (no CLI subcommand) and `pane`/`workspace report-metadata` as display-token writers that require host UI config (`$token` rows in `config.toml`). They do not improve workflow-run correctness or lifecycle waits, so this package intentionally does not wrap them or build a custom socket client for nominal coverage. Pane labels plus `workflow` tool progress remain the run-visibility surface.
@@ -188,7 +236,8 @@ The deterministic `workflow` tool uses `HerdrClient` / `HerdrStepExecutor` and o
 ```
 src/
   workflows/     # forked engine (no UI)
-  herdr/         # vendored interactive tools + client + HerdrStepExecutor + result-file protocol
-  child/         # workflow_done extension for agent panes
+  agent/         # AgentMedium + shared result-file protocol + test mock
+  herdr/         # Herdr pane medium, pi subprocess medium, client, vendored tools
+  child/         # workflow_done extension for agent children
   extension/     # thin /workflow command (no widget)
 ```

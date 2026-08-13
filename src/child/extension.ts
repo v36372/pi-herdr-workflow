@@ -1,9 +1,10 @@
 /**
  * Child-pane extension loaded into each agent node.
  *
- * `workflow_done` writes structured output to result.json. The child is an
- * interactive pi started by Herdr's agent facade; terminating this tool batch
- * settles the agent so `herdr agent prompt --wait` returns to the orchestrator.
+ * `workflow_done` writes structured output to result.json. The child is a
+ * vanilla pi process started by Herdr's agent facade or by standalone spawn;
+ * terminating this tool batch settles the agent so the orchestrator can read
+ * result.json.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -30,7 +31,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       if (!resultPath) {
         throw new Error(
-          "PI_WORKFLOW_RESULT_PATH is not set. workflow_done only works inside a Herdr-dispatched workflow agent.",
+          "PI_WORKFLOW_RESULT_PATH is not set. workflow_done only works inside a workflow-dispatched child agent.",
         );
       }
 
